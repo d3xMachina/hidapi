@@ -1367,6 +1367,104 @@ int HID_API_EXPORT_CALL HID_API_CALL hid_get_indexed_string(hid_device *dev, int
 	return 0;
 }
 
+int HID_API_EXPORT_CALL hid_winapi_get_instance_string(hid_device* dev, wchar_t* string, size_t maxlen)
+{
+	wchar_t* interface_path = NULL, *device_id = NULL;
+
+	if (!string || !maxlen) {
+		register_string_error(dev, L"Zero buffer/length");
+		return -1;
+	}
+
+	if (!dev->device_info) {
+		register_string_error(dev, L"NULL device info");
+		return -1;
+	}
+
+	interface_path = hid_internal_UTF8toUTF16(dev->device_info->path);
+	if (!interface_path) {
+		register_string_error(dev, L"Path conversion failure");
+		goto end;
+	}
+
+	/* Get the device id from interface path */
+	device_id = hid_internal_get_device_interface_property(interface_path, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
+	if (!device_id) {
+		register_string_error(dev, L"Failed to get device interface property InstanceId");
+		goto end;
+	}
+
+	wcsncpy(string, device_id, maxlen);
+	string[maxlen - 1] = L'\0';
+
+	register_string_error(dev, NULL);
+
+end:
+	free(interface_path);
+	free(device_id);
+
+	return 0;
+}
+
+int HID_API_EXPORT_CALL hid_winapi_get_parent_instance_string(hid_device* dev, wchar_t* string, size_t maxlen)
+{
+	wchar_t* interface_path = NULL, *device_id = NULL, *parent_id = NULL;
+	CONFIGRET cr = CR_FAILURE;
+	DEVINST dev_node;
+
+	if (!string || !maxlen) {
+		register_string_error(dev, L"Zero buffer/length");
+		return -1;
+	}
+
+	if (!dev->device_info) {
+		register_string_error(dev, L"NULL device info");
+		return -1;
+	}
+
+	interface_path = hid_internal_UTF8toUTF16(dev->device_info->path);
+	if (!interface_path) {
+		register_string_error(dev, L"Path conversion failure");
+		goto end;
+	}
+
+	/* Get the device id from interface path */
+	device_id = hid_internal_get_device_interface_property(interface_path, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
+	if (!device_id) {
+		register_string_error(dev, L"Failed to get device interface property InstanceId");
+		goto end;
+	}
+
+	/* Open devnode from device id */
+	cr = CM_Locate_DevNodeW(&dev_node, (DEVINSTID_W)device_id, CM_LOCATE_DEVNODE_NORMAL);
+	if (cr != CR_SUCCESS)
+		goto end;
+
+	/* Get devnode parent */
+	cr = CM_Get_Parent(&dev_node, dev_node, 0);
+	if (cr != CR_SUCCESS)
+		goto end;
+
+	/* Get the compatible ids from parent devnode */
+	parent_id = hid_internal_get_devnode_property(dev_node, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
+	if (!parent_id) {
+		register_string_error(dev, L"Failed to get parent device interface property InstanceId");
+		goto end;
+	}
+
+	wcsncpy(string, parent_id, maxlen);
+	string[maxlen - 1] = L'\0';
+
+	register_string_error(dev, NULL);
+
+end:
+	free(interface_path);
+	free(device_id);
+	free(parent_id);
+
+	return cr == CR_SUCCESS ? 0 : -1;
+}
+
 int HID_API_EXPORT_CALL hid_winapi_get_container_id(hid_device *dev, GUID *container_id)
 {
 	wchar_t *interface_path = NULL, *device_id = NULL;

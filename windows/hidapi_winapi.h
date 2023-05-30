@@ -67,6 +67,41 @@ extern "C" {
 		 */
 		int HID_API_EXPORT_CALL hid_winapi_descriptor_reconstruct_pp_data(void *hidp_preparsed_data, unsigned char *buf, size_t buf_size);
 
+
+		/** @brief Get the instance for a HID device.
+
+			Since version 0.14.0, @ref HID_API_VERSION >= HID_API_MAKE_VERSION(0, 14, 0)
+
+			This function returns the `DEVPKEY_Device_InstanceId` property of
+			the given device.
+
+			@ingroup API
+			@param dev A device handle returned from hid_open().
+			@param string A wide string buffer to put the data into.
+			@param maxlen The length of the buffer in multiples of wchar_t.
+
+			@returns
+				This function returns 0 on success and -1 on error.
+		*/
+		int HID_API_EXPORT_CALL hid_winapi_get_instance_string(hid_device* dev, wchar_t* string, size_t maxlen);
+
+		/** @brief Get the instance of the parent for a HID device.
+
+			Since version 0.14.0, @ref HID_API_VERSION >= HID_API_MAKE_VERSION(0, 14, 0)
+
+			This function returns the `DEVPKEY_Device_InstanceId` property of
+			the parent of the given device.
+
+			@ingroup API
+			@param dev A device handle returned from hid_open().
+			@param string A wide string buffer to put the data into.
+			@param maxlen The length of the buffer in multiples of wchar_t.
+
+			@returns
+				This function returns 0 on success and -1 on error.
+		*/
+		int HID_API_EXPORT_CALL hid_winapi_get_parent_instance_string(hid_device* dev, wchar_t* string, size_t maxlen);
+
 #ifdef __cplusplus
 }
 #endif
