@@ -48,6 +48,7 @@ typedef LONG NTSTATUS;
 #include <ntdef.h>
 #include <wctype.h>
 #define _wcsdup wcsdup
+#define _stricmp strcasecmp
 #endif
 
 /*#define HIDAPI_USE_DDK*/
@@ -68,6 +69,19 @@ typedef LONG NTSTATUS;
 /* MAXIMUM_USB_STRING_LENGTH from usbspec.h is 255 */
 /* BLUETOOTH_DEVICE_NAME_SIZE from bluetoothapis.h is 256 */
 #define MAX_STRING_WCHARS 256
+
+/* For certain USB devices, using a buffer larger or equal to 127 wchars results
+   in successful completion of HID API functions, but a broken string is stored
+   in the output buffer. This behaviour persists even if HID API is bypassed and
+   HID IOCTLs are passed to the HID driver directly. Therefore, for USB devices,
+   the buffer MUST NOT exceed 126 WCHARs.
+*/
+
+#define MAX_STRING_WCHARS_USB 126
+
+/* The value of the first callback handle to be given upon registration */
+/* Can be any arbitrary positive integer */
+#define FIRST_HOTPLUG_CALLBACK_HANDLE 1
 
 static struct hid_api_version api_version = {
 	.major = HID_API_VERSION_MAJOR,
@@ -174,19 +188,44 @@ err:
 #endif /* HIDAPI_USE_DDK */
 
 struct hid_device_ {
-		HANDLE device_handle;
-		BOOL blocking;
-		USHORT output_report_length;
-		unsigned char *write_buf;
-		size_t input_report_length;
-		USHORT feature_report_length;
-		unsigned char *feature_buf;
-		wchar_t *last_error_str;
-		BOOL read_pending;
-		char *read_buf;
-		OVERLAPPED ol;
-		OVERLAPPED write_ol;
-		struct hid_device_info* device_info;
+	HANDLE device_handle;
+	BOOL blocking;
+	USHORT output_report_length;
+	unsigned char *write_buf;
+	size_t input_report_length;
+	USHORT feature_report_length;
+	unsigned char *feature_buf;
+	wchar_t *last_error_str;
+	BOOL read_pending;
+	char *read_buf;
+	OVERLAPPED ol;
+	OVERLAPPED write_ol;
+	struct hid_device_info *device_info;
+};
+
+static struct hid_hotplug_context {
+	/* Win32 notification handle */
+	HCMNOTIFICATION notify_handle;
+
+	/* Critical section (faster mutex substitute), for both cached device list and callback list changes */
+	CRITICAL_SECTION critical_section;
+
+	BOOL critical_section_ready;
+
+	/* HIDAPI unique callback handle counter */
+	hid_hotplug_callback_handle next_handle;
+
+	/* Linked list of the hotplug callbacks */
+	struct hid_hotplug_callback *hotplug_cbs;
+
+	/* Linked list of the device infos (mandatory when the device is disconnected) */
+	struct hid_device_info *devs;
+} hid_hotplug_context = {
+	.notify_handle = NULL,
+	.critical_section_ready = 0,
+	.next_handle = FIRST_HOTPLUG_CALLBACK_HANDLE,
+	.hotplug_cbs = NULL,
+	.devs = NULL
 };
 
 static hid_device *new_hid_device()
@@ -358,9 +397,18 @@ HID_API_EXPORT const char* HID_API_CALL hid_version_str(void)
 	return HID_API_VERSION_STR;
 }
 
+static void hid_internal_hotplug_init()
+{
+	if (!hid_hotplug_context.critical_section_ready) {
+		InitializeCriticalSection(&hid_hotplug_context.critical_section);
+		hid_hotplug_context.critical_section_ready = 1;
+	}
+}
+
 int HID_API_EXPORT hid_init(void)
 {
 	register_global_error(NULL);
+
 #ifndef HIDAPI_USE_DDK
 	if (!hidapi_initialized) {
 		if (lookup_functions() < 0) {
@@ -370,7 +418,64 @@ int HID_API_EXPORT hid_init(void)
 		hidapi_initialized = TRUE;
 	}
 #endif
+
 	return 0;
+}
+
+static void hid_internal_hotplug_cleanup()
+{
+	/* Unregister the HID device connection notification when removing the last callback */
+	/* This function is always called inside a locked mutex */
+	if (hid_hotplug_context.hotplug_cbs != NULL) {
+		return;
+	}
+
+	if (hid_hotplug_context.devs) {
+		/* Cleanup connected device list */
+		hid_free_enumeration(hid_hotplug_context.devs);
+		hid_hotplug_context.devs = NULL;
+	}
+
+	if (hid_hotplug_context.notify_handle) {
+		if (CM_Unregister_Notification(hid_hotplug_context.notify_handle) != CR_SUCCESS) {
+			/* We mark an error, but we proceed with the cleanup */
+			register_global_error(L"CM_Unregister_Notification failed for Hotplug notification");
+		}
+	}
+
+	hid_hotplug_context.notify_handle = NULL;
+}
+
+struct hid_hotplug_callback {
+	hid_hotplug_callback_handle handle;
+	unsigned short vendor_id;
+	unsigned short product_id;
+	hid_hotplug_event events;
+	void *user_data;
+	hid_hotplug_callback_fn callback;
+
+	/* Pointer to the next notification */
+	struct hid_hotplug_callback *next;
+};
+
+static void hid_internal_hotplug_exit()
+{
+	if (!hid_hotplug_context.critical_section_ready) {
+		/* If the critical section is not initialized, we are safe to assume nothing else is */
+		return;
+	}
+	EnterCriticalSection(&hid_hotplug_context.critical_section);
+	struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs;
+	/* Remove all callbacks from the list */
+	while (*current) {
+		struct hid_hotplug_callback *next = (*current)->next;
+		free(*current);
+		*current = next;
+	}
+	hid_internal_hotplug_cleanup();
+	LeaveCriticalSection(&hid_hotplug_context.critical_section);
+	hid_hotplug_context.critical_section_ready = 0;
+	DeleteCriticalSection(&hid_hotplug_context.critical_section);
 }
 
 int HID_API_EXPORT hid_exit(void)
@@ -380,6 +485,9 @@ int HID_API_EXPORT hid_exit(void)
 	hidapi_initialized = FALSE;
 #endif
 	register_global_error(NULL);
+
+	hid_internal_hotplug_exit();
+
 	return 0;
 }
 
@@ -596,15 +704,24 @@ static void hid_internal_get_ble_info(struct hid_device_info* dev, DEVINST dev_n
 
 static int hid_internal_match_device_id(unsigned short vendor_id, unsigned short product_id, unsigned short expected_vendor_id, unsigned short expected_product_id)
 {
-    return (expected_vendor_id == 0x0 || vendor_id == expected_vendor_id) && (expected_product_id == 0x0 || product_id == expected_product_id);
+	return (expected_vendor_id == 0x0 || vendor_id == expected_vendor_id) && (expected_product_id == 0x0 || product_id == expected_product_id);
 }
 
+/* Unfortunately, HID_API_BUS_xxx constants alone aren't enough to distinguish between BLUETOOTH and BLE */
+#define HID_API_BUS_FLAG_BLE 0x01
 
-static void hid_internal_get_info(const wchar_t* interface_path, struct hid_device_info* dev)
+typedef struct hid_internal_detect_bus_type_result_ {
+	DEVINST dev_node;
+	hid_bus_type bus_type;
+	unsigned int bus_flags;
+} hid_internal_detect_bus_type_result;
+
+static hid_internal_detect_bus_type_result hid_internal_detect_bus_type(const wchar_t* interface_path)
 {
 	wchar_t *device_id = NULL, *compatible_ids = NULL;
 	CONFIGRET cr;
 	DEVINST dev_node;
+	hid_internal_detect_bus_type_result result = { 0 };
 
 	/* Get the device id from interface path */
 	device_id = hid_internal_get_device_interface_property(interface_path, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
@@ -635,42 +752,45 @@ static void hid_internal_get_info(const wchar_t* interface_path, struct hid_devi
 		   https://docs.microsoft.com/windows-hardware/drivers/hid/plug-and-play-support
 		   https://docs.microsoft.com/windows-hardware/drivers/install/standard-usb-identifiers */
 		if (wcsstr(compatible_id, L"USB") != NULL) {
-			dev->bus_type = HID_API_BUS_USB;
-			hid_internal_get_usb_info(dev, dev_node);
+			result.bus_type = HID_API_BUS_USB;
 			break;
 		}
 
 		/* Bluetooth devices
 		   https://docs.microsoft.com/windows-hardware/drivers/bluetooth/installing-a-bluetooth-device */
 		if (wcsstr(compatible_id, L"BTHENUM") != NULL) {
-			dev->bus_type = HID_API_BUS_BLUETOOTH;
+			result.bus_type = HID_API_BUS_BLUETOOTH;
 			break;
 		}
 
 		/* Bluetooth LE devices */
 		if (wcsstr(compatible_id, L"BTHLEDEVICE") != NULL) {
-			dev->bus_type = HID_API_BUS_BLUETOOTH;
-			hid_internal_get_ble_info(dev, dev_node);
+			result.bus_type = HID_API_BUS_BLUETOOTH;
+			result.bus_flags |= HID_API_BUS_FLAG_BLE;
 			break;
 		}
 
 		/* I2C devices
 		   https://docs.microsoft.com/windows-hardware/drivers/hid/plug-and-play-support-and-power-management */
 		if (wcsstr(compatible_id, L"PNP0C50") != NULL) {
-			dev->bus_type = HID_API_BUS_I2C;
+			result.bus_type = HID_API_BUS_I2C;
 			break;
 		}
 
 		/* SPI devices
 		   https://docs.microsoft.com/windows-hardware/drivers/hid/plug-and-play-for-spi */
 		if (wcsstr(compatible_id, L"PNP0C51") != NULL) {
-			dev->bus_type = HID_API_BUS_SPI;
+			result.bus_type = HID_API_BUS_SPI;
 			break;
 		}
 	}
+
+	result.dev_node = dev_node;
+
 end:
 	free(device_id);
 	free(compatible_ids);
+	return result;
 }
 
 static char *hid_internal_UTF16toUTF8(const wchar_t *src)
@@ -709,7 +829,10 @@ static struct hid_device_info *hid_internal_get_device_info(const wchar_t *path,
 	HIDD_ATTRIBUTES attrib;
 	PHIDP_PREPARSED_DATA pp_data = NULL;
 	HIDP_CAPS caps;
-	wchar_t string[MAX_STRING_WCHARS];
+	wchar_t string[MAX_STRING_WCHARS + 1];
+	ULONG len;
+	ULONG size;
+	hid_internal_detect_bus_type_result detect_bus_type_result;
 
 	/* Create the record. */
 	dev = (struct hid_device_info*)calloc(1, sizeof(struct hid_device_info));
@@ -743,25 +866,46 @@ static struct hid_device_info *hid_internal_get_device_info(const wchar_t *path,
 		HidD_FreePreparsedData(pp_data);
 	}
 
+	/* detect bus type before reading string descriptors */
+	detect_bus_type_result = hid_internal_detect_bus_type(path);
+	dev->bus_type = detect_bus_type_result.bus_type;
+
+	len = dev->bus_type == HID_API_BUS_USB ? MAX_STRING_WCHARS_USB : MAX_STRING_WCHARS;
+	string[len] = L'\0';
+	size = len * sizeof(wchar_t);
+
 	/* Serial Number */
 	string[0] = L'\0';
-	HidD_GetSerialNumberString(handle, string, sizeof(string));
-	string[MAX_STRING_WCHARS - 1] = L'\0';
+	HidD_GetSerialNumberString(handle, string, size);
 	dev->serial_number = _wcsdup(string);
 
 	/* Manufacturer String */
 	string[0] = L'\0';
-	HidD_GetManufacturerString(handle, string, sizeof(string));
-	string[MAX_STRING_WCHARS - 1] = L'\0';
+	HidD_GetManufacturerString(handle, string, size);
 	dev->manufacturer_string = _wcsdup(string);
 
 	/* Product String */
 	string[0] = L'\0';
-	HidD_GetProductString(handle, string, sizeof(string));
-	string[MAX_STRING_WCHARS - 1] = L'\0';
+	HidD_GetProductString(handle, string, size);
 	dev->product_string = _wcsdup(string);
 
-	hid_internal_get_info(path, dev);
+	/* now, the portion that depends on string descriptors */
+	switch (dev->bus_type) {
+	case HID_API_BUS_USB:
+		hid_internal_get_usb_info(dev, detect_bus_type_result.dev_node);
+		break;
+
+	case HID_API_BUS_BLUETOOTH:
+		if (detect_bus_type_result.bus_flags & HID_API_BUS_FLAG_BLE)
+			hid_internal_get_ble_info(dev, detect_bus_type_result.dev_node);
+		break;
+
+	case HID_API_BUS_UNKNOWN:
+	case HID_API_BUS_SPI:
+	case HID_API_BUS_I2C:
+		/* shut down -Wswitch */
+		break;
+	}
 
 	return dev;
 }
@@ -885,40 +1029,9 @@ void  HID_API_EXPORT HID_API_CALL hid_free_enumeration(struct hid_device_info *d
 	}
 }
 
-struct hid_hotplug_callback {
-	hid_hotplug_callback_handle handle;
-	unsigned short vendor_id;
-	unsigned short product_id;
-	hid_hotplug_event events;
-	void *user_data;
-	hid_hotplug_callback_fn callback;
-
-	/* Pointer to the next notification */
-	struct hid_hotplug_callback *next;
-};
-
-static struct hid_hotplug_context {
-	/* Win32 notification handle */
-	HCMNOTIFICATION notify_handle;
-
-	/* HIDAPI unique callback handle counter */
-	hid_hotplug_callback_handle next_handle;
-
-	/* Linked list of the hotplug callbacks */
-	struct hid_hotplug_callback *hotplug_cbs;
-
-	/* Linked list of the device infos (mandatory when the device is disconnected) */
-	struct hid_device_info *devs;
-} hid_hotplug_context = {
-	.notify_handle = NULL,
-	.next_handle = 1,
-	.hotplug_cbs = NULL,
-	.devs = NULL
-};
-
 DWORD WINAPI hid_internal_notify_callback(HCMNOTIFICATION notify, PVOID context, CM_NOTIFY_ACTION action, PCM_NOTIFY_EVENT_DATA event_data, DWORD event_data_size)
 {
-	struct hid_device_info* device = NULL;
+	struct hid_device_info *device = NULL;
 	hid_hotplug_event hotplug_event = 0;
 
 	(void)notify;
@@ -928,6 +1041,9 @@ DWORD WINAPI hid_internal_notify_callback(HCMNOTIFICATION notify, PVOID context,
 	if (event_data == NULL || event_data->FilterType != CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE) {
 		return ERROR_SUCCESS;
 	}
+
+	/* Lock the mutex to avoid race conditions */
+	EnterCriticalSection(&hid_hotplug_context.critical_section);
 
 	if (action == CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL) {
 		HANDLE read_handle;
@@ -947,20 +1063,18 @@ DWORD WINAPI hid_internal_notify_callback(HCMNOTIFICATION notify, PVOID context,
 
 		/* Append to the end of the device list */
 		if (hid_hotplug_context.devs != NULL) {
-			struct hid_device_info* last = hid_hotplug_context.devs;
+			struct hid_device_info *last = hid_hotplug_context.devs;
 			while (last->next != NULL) {
 				last = last->next;
 			}
 			last->next = device;
-		}
-		else {
+		} else {
 			hid_hotplug_context.devs = device;
 		}
 
 		CloseHandle(read_handle);
-	}
-	else if (action == CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL) {
-		char* path;
+	} else if (action == CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL) {
+		char *path;
 
 		hotplug_event = HID_API_HOTPLUG_EVENT_DEVICE_LEFT;
 
@@ -971,10 +1085,10 @@ DWORD WINAPI hid_internal_notify_callback(HCMNOTIFICATION notify, PVOID context,
 		}
 
 		/* Get and remove this device from the device list */
-		for (struct hid_device_info** current = &hid_hotplug_context.devs; *current; current = &(*current)->next) {
+		for (struct hid_device_info **current = &hid_hotplug_context.devs; *current; current = &(*current)->next) {
 			/* Case-independent path comparison is mandatory */
 			if (_stricmp((*current)->path, path) == 0) {
-				struct hid_device_info* next = (*current)->next;
+				struct hid_device_info *next = (*current)->next;
 				device = *current;
 				*current = next;
 				break;
@@ -986,32 +1100,31 @@ DWORD WINAPI hid_internal_notify_callback(HCMNOTIFICATION notify, PVOID context,
 
 	if (device) {
 		/* Call the notifications for the device */
-		struct hid_hotplug_callback *hotplug_cb = hid_hotplug_context.hotplug_cbs;
-		while (hotplug_cb != NULL) {
-			if ((hotplug_cb->events & hotplug_event) &&
-				hid_internal_match_device_id(device->vendor_id, device->product_id, hotplug_cb->vendor_id, hotplug_cb->product_id)) {
-				struct hid_hotplug_callback* cur_hotplug_cb = hotplug_cb;
-				hotplug_cb = cur_hotplug_cb->next;
-
-				if ((*cur_hotplug_cb->callback)(cur_hotplug_cb->handle, device, hotplug_event, cur_hotplug_cb->user_data)) {
-					hid_hotplug_deregister_callback(cur_hotplug_cb->handle);
-
-					/* Last callback was unregistered */
-					if (hid_hotplug_context.hotplug_cbs == NULL) {
-						break;
-					}
+		struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs;
+		while (*current) {
+			struct hid_hotplug_callback *callback = *current;
+			if ((callback->events & hotplug_event) && hid_internal_match_device_id(device->vendor_id, device->product_id, callback->vendor_id, callback->product_id)) {
+				int result = (callback->callback)(callback->handle, device, hotplug_event, callback->user_data);
+				/* If the result is non-zero, we remove the callback and proceed */
+				/* Do not use the deregister call as it locks the mutex, and we are currently in a lock */
+				if (result) {
+					*current = (*current)->next;
+					free(callback);
+					continue;
 				}
 			}
-			else {
-				hotplug_cb = hotplug_cb->next;
-			}
+			current = &callback->next;
 		}
 
 		/* Free removed device */
 		if (hotplug_event == HID_API_HOTPLUG_EVENT_DEVICE_LEFT) {
 			free(device);
 		}
+
+		hid_internal_hotplug_cleanup();
 	}
+
+	LeaveCriticalSection(&hid_hotplug_context.critical_section);
 
 	return ERROR_SUCCESS;
 }
@@ -1042,7 +1155,12 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 	hotplug_cb->user_data = user_data;
 	hotplug_cb->callback = callback;
 
-	/* TODO: protect the handle by the context hotplug lock */
+	/* Ensure we are ready to actually use the mutex */
+	hid_internal_hotplug_init();
+
+	/* Lock the mutex to avoid race conditions */
+	EnterCriticalSection(&hid_hotplug_context.critical_section);
+
 	hotplug_cb->handle = hid_hotplug_context.next_handle++;
 
 	/* handle the unlikely case of handle overflow */
@@ -1065,8 +1183,8 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 		last->next = hotplug_cb;
 	}
 	else {
-        GUID interface_class_guid;
-        CM_NOTIFY_FILTER notify_filter = { 0 };
+		GUID interface_class_guid;
+		CM_NOTIFY_FILTER notify_filter = { 0 };
 
 		/* Fill already connected devices so we can use this info in disconnection notification */
 		hid_hotplug_context.devs = hid_enumerate(0, 0);
@@ -1075,6 +1193,7 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 
 		if (hid_hotplug_context.notify_handle != NULL) {
 			register_global_error(L"Device notification have already been registered");
+			LeaveCriticalSection(&hid_hotplug_context.critical_section);
 			return -1;
 		}
 
@@ -1089,6 +1208,7 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 		/* Register for a HID device notification when adding the first callback */
 		if (CM_Register_Notification(&notify_filter, NULL, hid_internal_notify_callback, &hid_hotplug_context.notify_handle) != CR_SUCCESS) {
 			register_global_error(L"hid_hotplug_register_callback/CM_Register_Notification");
+			LeaveCriticalSection(&hid_hotplug_context.critical_section);
 			return -1;
 		}
 	}
@@ -1105,14 +1225,22 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 		}
 	}
 
+	LeaveCriticalSection(&hid_hotplug_context.critical_section);
+
 	return 0;
 }
 
 int HID_API_EXPORT HID_API_CALL hid_hotplug_deregister_callback(hid_hotplug_callback_handle callback_handle)
 {
-	struct hid_hotplug_callback *hotplug_cb = NULL;
+	if (callback_handle <= 0 || !hid_hotplug_context.critical_section_ready) {
+		return -1;
+	}
 
-	if (callback_handle <= 0 || hid_hotplug_context.hotplug_cbs == NULL) {
+	/* Lock the mutex to avoid race conditions */
+	EnterCriticalSection(&hid_hotplug_context.critical_section);
+
+	if (!hid_hotplug_context.hotplug_cbs) {
+		LeaveCriticalSection(&hid_hotplug_context.critical_section);
 		return -1;
 	}
 
@@ -1120,36 +1248,15 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_deregister_callback(hid_hotplug_call
 	for (struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs; *current != NULL; current = &(*current)->next) {
 		if ((*current)->handle == callback_handle) {
 			struct hid_hotplug_callback *next = (*current)->next;
-			hotplug_cb = *current;
+			free(*current);
 			*current = next;
 			break;
 		}
 	}
 
-	if (hotplug_cb == NULL) {
-		return -1;
-	}
+	hid_internal_hotplug_cleanup();
 
-	free(hotplug_cb);
-
-	/* Unregister a HID device connection notification when removing the last callback */
-	if (hid_hotplug_context.hotplug_cbs == NULL) {
-		/* Cleanup connected device list */
-		hid_free_enumeration(hid_hotplug_context.devs);
-		hid_hotplug_context.devs = NULL;
-
-		if (hid_hotplug_context.notify_handle == NULL) {
-			register_global_error(L"Device notification have already been unregistered");
-			return -1;
-		}
-
-		if (CM_Unregister_Notification(hid_hotplug_context.notify_handle) != CR_SUCCESS) {
-			register_global_error(L"hid_hotplug_deregister_callback/CM_Unregister_Notification");
-			return -1;
-		}
-
-		hid_hotplug_context.notify_handle = NULL;
-	}
+	LeaveCriticalSection(&hid_hotplug_context.critical_section);
 
 	return 0;
 }
@@ -1393,20 +1500,19 @@ int HID_API_EXPORT HID_API_CALL hid_read_timeout(hid_device *dev, unsigned char 
 	}
 
 	if (overlapped) {
-		if (milliseconds >= 0) {
-			/* See if there is any data yet. */
-			res = WaitForSingleObject(ev, milliseconds);
-			if (res != WAIT_OBJECT_0) {
-				/* There was no data this time. Return zero bytes available,
-				   but leave the Overlapped I/O running. */
-				return 0;
-			}
+		/* See if there is any data yet. */
+		res = WaitForSingleObject(ev, milliseconds >= 0 ? (DWORD)milliseconds : INFINITE);
+		if (res != WAIT_OBJECT_0) {
+			/* There was no data this time. Return zero bytes available,
+			   but leave the Overlapped I/O running. */
+			return 0;
 		}
 
-		/* Either WaitForSingleObject() told us that ReadFile has completed, or
-		   we are in non-blocking mode. Get the number of bytes read. The actual
-		   data has been copied to the data[] array which was passed to ReadFile(). */
-		res = GetOverlappedResult(dev->device_handle, &dev->ol, &bytes_read, TRUE/*wait*/);
+		/* Get the number of bytes read. The actual data has been copied to the data[]
+		   array which was passed to ReadFile(). We must not wait here because we've
+		   already waited on our event above, and since it's auto-reset, it will have
+		   been reset back to unsignalled by now. */
+		res = GetOverlappedResult(dev->device_handle, &dev->ol, &bytes_read, FALSE/*don't wait now - already did on the prev step*/);
 	}
 	/* Set pending back to false, even if GetOverlappedResult() returned error. */
 	dev->read_pending = FALSE;
@@ -1633,7 +1739,12 @@ int HID_API_EXPORT_CALL HID_API_CALL hid_get_indexed_string(hid_device *dev, int
 {
 	BOOL res;
 
-	res = HidD_GetIndexedString(dev->device_handle, string_index, string, sizeof(wchar_t) * (DWORD) MIN(maxlen, MAX_STRING_WCHARS));
+	if (dev->device_info && dev->device_info->bus_type == HID_API_BUS_USB && maxlen > MAX_STRING_WCHARS_USB) {
+		string[MAX_STRING_WCHARS_USB] = L'\0';
+		maxlen = MAX_STRING_WCHARS_USB;
+	}
+
+	res = HidD_GetIndexedString(dev->device_handle, string_index, string, (ULONG)maxlen * sizeof(wchar_t));
 	if (!res) {
 		register_winapi_error(dev, L"HidD_GetIndexedString");
 		return -1;
