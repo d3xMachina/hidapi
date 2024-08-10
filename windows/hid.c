@@ -83,6 +83,16 @@ typedef LONG NTSTATUS;
 /* Can be any arbitrary positive integer */
 #define FIRST_HOTPLUG_CALLBACK_HANDLE 1
 
+#if defined(__GNUC__)
+#define thread_local __thread
+#elif __STDC_VERSION__ >= 201112L
+#define thread_local _Thread_local
+#elif defined(_MSC_VER)
+#define thread_local __declspec(thread)
+#else
+#error Cannot define thread_local
+#endif
+
 static struct hid_api_version api_version = {
 	.major = HID_API_VERSION_MAJOR,
 	.minor = HID_API_VERSION_MINOR,
@@ -189,8 +199,6 @@ err:
 
 #endif /* HIDAPI_USE_DDK */
 
-#define TLS __declspec(thread)
-
 struct hid_device_error
 {
 	HANDLE device_handle;
@@ -199,7 +207,7 @@ struct hid_device_error
 	struct hid_device_error *next;
 };
 
-static TLS struct hid_device_error *global_device_error = NULL;
+static thread_local struct hid_device_error *global_device_error = NULL;
 
 struct hid_device_ {
 	HANDLE device_handle;
@@ -459,7 +467,7 @@ static void register_string_error(hid_device *dev, const WCHAR *string_error)
 	register_string_error_to_buffer(error_buffer, string_error);
 }
 
-static TLS wchar_t *last_global_error_str = NULL;
+static thread_local wchar_t *last_global_error_str = NULL;
 
 static void register_global_winapi_error(const WCHAR *op)
 {
