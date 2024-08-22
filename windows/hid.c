@@ -78,16 +78,6 @@ typedef LONG NTSTATUS;
 
 #define MAX_STRING_WCHARS_USB 126
 
-#if defined(__GNUC__)
-#define thread_local __thread
-#elif __STDC_VERSION__ >= 201112L
-#define thread_local _Thread_local
-#elif defined(_MSC_VER)
-#define thread_local __declspec(thread)
-#else
-#error Cannot define thread_local
-#endif
-
 static struct hid_api_version api_version = {
 	.major = HID_API_VERSION_MAJOR,
 	.minor = HID_API_VERSION_MINOR,
@@ -190,21 +180,18 @@ err:
 
 #endif /* HIDAPI_USE_DDK */
 
-typedef void (*tls_destructor)(void **data, hid_device *dev, BOOLEAN all_devices);
-
-struct tls_allocation {
-	void *data;
-	DWORD thread_id;
-	tls_destructor destructor;
-
-	struct tls_allocation *next;
-};
-
 struct device_error {
-	HANDLE device_handle;
+	HANDLE device_handle; // Use a NULL device handle for the global error
 	wchar_t *last_error_str;
 
 	struct device_error *next;
+};
+
+struct tls_allocation {
+	DWORD thread_id;
+	struct device_error *device_errors;
+
+	struct tls_allocation *next;
 };
 
 struct tls_context {
@@ -217,9 +204,6 @@ static struct tls_context tls_context = {
 	.allocated = NULL,
 	.critical_section_ready = FALSE
 };
-
-// Use a NULL device handle for the global error
-static thread_local struct device_error *device_error = NULL;
 
 struct hid_device_ {
 		HANDLE device_handle;
@@ -260,102 +244,6 @@ static hid_device *new_hid_device()
 	dev->device_info = NULL;
 
 	return dev;
-}
-
-static void tls_init_context()
-{
-	if (!tls_context.critical_section_ready) {
-		InitializeCriticalSection(&tls_context.critical_section);
-		tls_context.critical_section_ready = TRUE;
-	}
-}
-
-static void tls_exit_context()
-{
-	if (tls_context.critical_section_ready) {
-		DeleteCriticalSection(&tls_context.critical_section);
-		tls_context.critical_section_ready = FALSE;
-	}
-}
-
-static void tls_register(void* data, tls_destructor destructor)
-{
-	if (!tls_context.critical_section_ready) {
-		return;
-	}
-
-	DWORD thread_id = GetCurrentThreadId();
-
-	EnterCriticalSection(&tls_context.critical_section);
-
-	struct tls_allocation *current = tls_context.allocated;
-	struct tls_allocation *prev = NULL;
-
-	while (current)	{
-		prev = current;
-		current = current->next;
-	}
-
-	struct tls_allocation *tls = (struct tls_allocation*) malloc(sizeof(struct tls_allocation));
-	tls->data = data;
-	tls->thread_id = thread_id;
-	tls->destructor = destructor;
-	tls->next = NULL;
-
-	if (prev) {
-		prev->next = tls;
-	}
-	else {
-		tls_context.allocated = tls;
-	}
-
-	LeaveCriticalSection(&tls_context.critical_section);
-}
-
-static void tls_free(DWORD thread_id, hid_device *dev, BOOLEAN all_devices)
-{
-	if (!tls_context.critical_section_ready) {
-		return;
-	}
-
-	EnterCriticalSection(&tls_context.critical_section);
-
-	struct tls_allocation *current = tls_context.allocated;
-	struct tls_allocation *prev = NULL;
-
-	while (current)	{
-		if (thread_id != 0 && thread_id != current->thread_id) {
-			prev = current;
-			current = current->next;
-			continue;
-		}
-
-		current->destructor(&current->data, dev, all_devices);
-
-		if (current->data == NULL) {
-			if (prev) {
-				prev->next = current->next;
-			}
-			else {
-				tls_context.allocated = current->next;
-			}
-
-			struct tls_allocation *current_tmp = current;
-			current = current->next;
-			free(current_tmp);
-		}
-		else {
-			prev = current;
-			current = current->next;
-		}
-	}
-
-	LeaveCriticalSection(&tls_context.critical_section);
-}
-
-static void tls_free_all_threads(hid_device *dev, BOOLEAN all_devices)
-{
-	tls_free(0, dev, all_devices);
 }
 
 static void free_error_buffer(struct device_error **error, hid_device *dev, BOOLEAN all_devices)
@@ -399,6 +287,109 @@ static void free_error_buffer(struct device_error **error, hid_device *dev, BOOL
 			current = current->next;
 		}
 	}
+}
+
+static void tls_init_context()
+{
+	if (!tls_context.critical_section_ready) {
+		InitializeCriticalSection(&tls_context.critical_section);
+		tls_context.critical_section_ready = TRUE;
+	}
+}
+
+static void tls_exit_context()
+{
+	if (tls_context.critical_section_ready) {
+		DeleteCriticalSection(&tls_context.critical_section);
+		tls_context.critical_section_ready = FALSE;
+	}
+}
+
+static struct tls_allocation* tls_get(DWORD thread_id)
+{
+	if (!tls_context.critical_section_ready) {
+		return NULL;
+	}
+
+	EnterCriticalSection(&tls_context.critical_section);
+
+	struct tls_allocation *current = tls_context.allocated;
+	struct tls_allocation *prev = NULL;
+
+	while (current) {
+		if (current->thread_id == thread_id) {
+			break;
+		}
+
+		prev = current;
+		current = current->next;
+	}
+
+	if (current == NULL) {
+		struct tls_allocation *tls = (struct tls_allocation*) malloc(sizeof(struct tls_allocation));
+		tls->thread_id = thread_id;
+		tls->device_errors = NULL;
+		tls->next = NULL;
+		
+		if (prev) {
+			prev->next = tls;
+		}
+		else {
+			tls_context.allocated = tls;
+		}
+
+		current = tls;
+	}
+
+	LeaveCriticalSection(&tls_context.critical_section);
+
+	return current;
+}
+
+static void tls_free(DWORD thread_id, hid_device *dev, BOOLEAN all_devices)
+{
+	if (!tls_context.critical_section_ready) {
+		return;
+	}
+
+	EnterCriticalSection(&tls_context.critical_section);
+
+	struct tls_allocation *current = tls_context.allocated;
+	struct tls_allocation *prev = NULL;
+
+	while (current)	{
+		if (thread_id != 0 && thread_id != current->thread_id) {
+			prev = current;
+			current = current->next;
+			continue;
+		}
+
+		free_error_buffer(&current->device_errors, dev, all_devices);
+
+		if (current->device_errors == NULL) {
+			if (prev) {
+				prev->next = current->next;
+			}
+			else {
+				tls_context.allocated = current->next;
+			}
+
+			struct tls_allocation *current_tmp = current;
+			current = current->next;
+			free(current_tmp);
+		}
+		else {
+			prev = current;
+			current = current->next;
+		}
+	}
+
+	LeaveCriticalSection(&tls_context.critical_section);
+}
+
+static void tls_free_all_threads(hid_device *dev, BOOLEAN all_devices)
+{
+	tls_free(0, dev, all_devices);
 }
 
 static void free_hid_device(hid_device *dev)
@@ -495,7 +486,13 @@ static void register_string_error_to_buffer(wchar_t **error_buffer, const WCHAR 
 
 static wchar_t** get_error_buffer(hid_device *dev)
 {
-	struct device_error *current = device_error;
+	struct tls_allocation* tls = tls_get(GetCurrentThreadId());
+
+	if (tls == NULL) {
+		return NULL;
+	}
+
+	struct device_error *current = tls->device_errors;
 	struct device_error *prev = NULL;
 
 	while (current) {
@@ -517,8 +514,7 @@ static wchar_t** get_error_buffer(hid_device *dev)
 		prev->next = error;
 	}
 	else {
-		device_error = error;
-		tls_register(device_error, (tls_destructor)&free_error_buffer);
+		tls->device_errors = error;
 	}
 
 	return &error->last_error_str;
@@ -526,7 +522,13 @@ static wchar_t** get_error_buffer(hid_device *dev)
 
 static wchar_t* get_error_str(hid_device *dev)
 {
-	struct device_error *current = device_error;
+	struct tls_allocation* tls = tls_get(GetCurrentThreadId());
+
+	if (tls == NULL) {
+		return NULL;
+	}
+
+	struct device_error *current = tls->device_errors;
 
 	while (current) {
 		if ((dev == NULL && current->device_handle == NULL) ||
