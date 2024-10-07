@@ -1478,7 +1478,7 @@ static void *read_thread(void *param)
 		dev->device_handle,
 		dev->input_endpoint,
 		buf,
-		length,
+		(int)length,
 		read_callback,
 		dev,
 		5000/*timeout*/);
@@ -1720,6 +1720,10 @@ hid_device * HID_API_EXPORT hid_open_path(const char *path)
 		return NULL;
 
 	dev = new_hid_device();
+	if (!dev) {
+		LOG("hid_open_path failed: Couldn't allocate memory\n");
+		return NULL;
+	}
 
 	libusb_get_device_list(usb_context, &devs);
 	while ((usb_dev = devs[d++]) != NULL && !good_open) {
@@ -1791,6 +1795,10 @@ HID_API_EXPORT hid_device * HID_API_CALL hid_libusb_wrap_sys_device(intptr_t sys
 		return NULL;
 
 	dev = new_hid_device();
+	if (!dev) {
+		LOG("libusb_wrap_sys_device failed: Couldn't allocate memory\n");
+		return NULL;
+	}
 
 	res = libusb_wrap_sys_device(usb_context, sys_dev, &dev->device_handle);
 	if (res < 0) {
@@ -1879,7 +1887,7 @@ int HID_API_EXPORT hid_write(hid_device *dev, const unsigned char *data, size_t 
 	res = libusb_interrupt_transfer(dev->device_handle,
 		dev->output_endpoint,
 		(unsigned char*)data,
-		length,
+		(int)length,
 		&actual_length, 1000);
 
 	if (res < 0)
@@ -1904,7 +1912,7 @@ static int return_data(hid_device *dev, unsigned char *data, size_t length)
 	dev->input_reports = rpt->next;
 	free(rpt->data);
 	free(rpt);
-	return len;
+	return (int)len;
 }
 
 static void cleanup_mutex(void *param)
@@ -2037,7 +2045,7 @@ int HID_API_EXPORT hid_send_feature_report(hid_device *dev, const unsigned char 
 	if (skipped_report_id)
 		length++;
 
-	return length;
+	return (int)length;
 }
 
 int HID_API_EXPORT hid_get_feature_report(hid_device *dev, unsigned char *data, size_t length)
