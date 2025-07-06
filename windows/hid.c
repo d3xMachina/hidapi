@@ -133,6 +133,14 @@ static HMODULE hid_lib_handle = NULL;
 static HMODULE cfgmgr32_lib_handle = NULL;
 static BOOLEAN hidapi_initialized = FALSE;
 
+// Todo: add an error code for every errors
+// Errors must be a negative value, Win32 API use the 0x0000 to 0xFFFF range
+enum ErrorCode
+{
+	EC_SUCCESS = 0,
+	EC_UNKNOWN_FAILURE = -1
+};
+
 static void free_library_handles()
 {
 	if (hid_lib_handle)
@@ -453,7 +461,7 @@ static void free_hid_device(hid_device *dev)
 
 static void register_winapi_error_to_device(struct device_error* device_error, const WCHAR *op)
 {
-	device_error->last_error_code = 0;
+	device_error->last_error_code = EC_SUCCESS;
 
 	free(device_error->last_error_str);
 	device_error->last_error_str = NULL;
@@ -522,12 +530,13 @@ static void register_winapi_error_to_device(struct device_error* device_error, c
 
 static void register_string_error_to_device(struct device_error* device_error, const WCHAR *string_error)
 {
-	device_error->last_error_code = 0;
+	device_error->last_error_code = EC_SUCCESS;
 
 	free(device_error->last_error_str);
 	device_error->last_error_str = NULL;
 
 	if (string_error) {
+		device_error->last_error_code = EC_UNKNOWN_FAILURE;
 		device_error->last_error_str = _wcsdup(string_error);
 	}
 }
@@ -553,7 +562,7 @@ static struct device_error* get_device_error(hid_device *dev)
 
 	struct device_error *error = (struct device_error*) malloc(sizeof(struct device_error));
 	error->device_handle = dev != NULL ? dev->device_handle : NULL;
-	error->last_error_code = 0;
+	error->last_error_code = EC_SUCCESS;
 	error->last_error_str = NULL;
 	error->next = NULL;
 
@@ -2258,7 +2267,7 @@ HID_API_EXPORT const wchar_t * HID_API_CALL hid_error(hid_device *dev)
 HID_API_EXPORT int HID_API_CALL hid_error_code(hid_device *dev)
 {
 	struct device_error* device_error = find_device_error(dev);
-	int error_code = device_error != NULL ? device_error->last_error_code : 0;
+	int error_code = device_error != NULL ? device_error->last_error_code : EC_SUCCESS;
 	return error_code;
 }
 
