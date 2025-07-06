@@ -734,6 +734,24 @@ extern "C" {
 		*/
 		HID_API_EXPORT const wchar_t* HID_API_CALL hid_error(hid_device *dev);
 
+		/** @brief Get the code corresponding to the last error which occured.
+
+			It will contains a non-zero value if the last error is a win32 API error.
+
+			Any HIDAPI function that can explicitly indicate an execution failure
+			(e.g. by an error code, or by returning NULL) - may set the error code,
+			to be returned by this function.
+
+			@ingroup API
+			@param dev A device handle returned from hid_open(),
+			  or NULL to get the last non-device-specific error
+			  (e.g. for errors in hid_open() or hid_enumerate()).
+
+			@returns
+				A code of the last error (if any).
+		*/
+		HID_API_EXPORT int HID_API_CALL hid_error_code(hid_device *dev);
+
 		/** @brief Get a runtime version of the library.
 
 			This function is thread-safe.

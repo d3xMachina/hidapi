@@ -212,6 +212,7 @@ struct tls_allocation {
 struct device_error {
 	HANDLE device_handle;
 	wchar_t *last_error_str;
+	int last_error_code;
 
 	struct device_error *next;
 };
@@ -450,10 +451,12 @@ static void free_hid_device(hid_device *dev)
 	free(dev);
 }
 
-static void register_winapi_error_to_buffer(wchar_t **error_buffer, const WCHAR *op)
+static void register_winapi_error_to_device(struct device_error* device_error, const WCHAR *op)
 {
-	free(*error_buffer);
-	*error_buffer = NULL;
+	device_error->last_error_code = 0;
+
+	free(device_error->last_error_str);
+	device_error->last_error_str = NULL;
 
 	/* Only clear out error messages if NULL is passed into op */
 	if (!op) {
@@ -462,6 +465,8 @@ static void register_winapi_error_to_buffer(wchar_t **error_buffer, const WCHAR 
 
 	WCHAR system_err_buf[1024];
 	DWORD error_code = GetLastError();
+
+	device_error->last_error_code = error_code;
 
 	DWORD system_err_len = FormatMessageW(
 		FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -482,8 +487,8 @@ static void register_winapi_error_to_buffer(wchar_t **error_buffer, const WCHAR 
 		+ system_err_len
 		;
 
-	*error_buffer = (WCHAR *)calloc(msg_len + 1, sizeof (WCHAR));
-	WCHAR *msg = *error_buffer;
+	device_error->last_error_str = (WCHAR *)calloc(msg_len + 1, sizeof (WCHAR));
+	WCHAR *msg = device_error->last_error_str;
 
 	if (!msg)
 		return;
@@ -515,13 +520,15 @@ static void register_winapi_error_to_buffer(wchar_t **error_buffer, const WCHAR 
  * |         free(*error_buffer);
  * Which doesn't make sense in this context. */
 
-static void register_string_error_to_buffer(wchar_t **error_buffer, const WCHAR *string_error)
+static void register_string_error_to_device(struct device_error* device_error, const WCHAR *string_error)
 {
-	free(*error_buffer);
-	*error_buffer = NULL;
+	device_error->last_error_code = 0;
+
+	free(device_error->last_error_str);
+	device_error->last_error_str = NULL;
 
 	if (string_error) {
-		*error_buffer = _wcsdup(string_error);
+		device_error->last_error_str = _wcsdup(string_error);
 	}
 }
 
@@ -529,7 +536,7 @@ static void register_string_error_to_buffer(wchar_t **error_buffer, const WCHAR 
 # pragma GCC diagnostic pop
 #endif
 
-static wchar_t** get_error_buffer(hid_device *dev)
+static struct device_error* get_device_error(hid_device *dev)
 {
 	struct device_error *current = device_error;
 	struct device_error *prev = NULL;
@@ -537,7 +544,7 @@ static wchar_t** get_error_buffer(hid_device *dev)
 	while (current) {
 		if ((dev == NULL && current->device_handle == NULL) ||
 			(dev != NULL && dev->device_handle == current->device_handle)) {
-			return &current->last_error_str;
+			return current;
 		}
 
 		prev = current;
@@ -546,6 +553,7 @@ static wchar_t** get_error_buffer(hid_device *dev)
 
 	struct device_error *error = (struct device_error*) malloc(sizeof(struct device_error));
 	error->device_handle = dev != NULL ? dev->device_handle : NULL;
+	error->last_error_code = 0;
 	error->last_error_str = NULL;
 	error->next = NULL;
 
@@ -557,17 +565,17 @@ static wchar_t** get_error_buffer(hid_device *dev)
 		tls_register(device_error, (tls_destructor)&free_error_buffer);
 	}
 
-	return &error->last_error_str;
+	return error;
 }
 
-static wchar_t* get_error_str(hid_device *dev)
+static struct device_error* find_device_error(hid_device *dev)
 {
 	struct device_error *current = device_error;
 
 	while (current) {
 		if ((dev == NULL && current->device_handle == NULL) ||
 			(dev != NULL && dev->device_handle == current->device_handle)) {
-			return current->last_error_str;
+			return current;
 		}
 
 		current = current->next;
@@ -578,26 +586,26 @@ static wchar_t* get_error_str(hid_device *dev)
 
 static void register_winapi_error(hid_device *dev, const WCHAR *op)
 {
-	wchar_t **error_buffer = get_error_buffer(dev);
-	register_winapi_error_to_buffer(error_buffer, op);
+	struct device_error* device_error = get_device_error(dev);
+	register_winapi_error_to_device(device_error, op);
 }
 
 static void register_string_error(hid_device *dev, const WCHAR *string_error)
 {
-	wchar_t **error_buffer = get_error_buffer(dev);
-	register_string_error_to_buffer(error_buffer, string_error);
+	struct device_error* device_error = get_device_error(dev);
+	register_string_error_to_device(device_error, string_error);
 }
 
 static void register_global_winapi_error(const WCHAR *op)
 {
-	wchar_t **error_buffer = get_error_buffer(NULL);
-	register_winapi_error_to_buffer(error_buffer, op);
+	struct device_error* device_error = get_device_error(NULL);
+	register_winapi_error_to_device(device_error, op);
 }
 
 static void register_global_error(const WCHAR *string_error)
 {
-	wchar_t **error_buffer = get_error_buffer(NULL);
-	register_string_error_to_buffer(error_buffer, string_error);
+	struct device_error* device_error = get_device_error(NULL);
+	register_string_error_to_device(device_error, string_error);
 }
 
 static HANDLE open_device(const wchar_t *path, BOOL open_rw)
@@ -2238,12 +2246,20 @@ int HID_API_EXPORT_CALL hid_get_report_descriptor(hid_device *dev, unsigned char
 	return res;
 }
 
-HID_API_EXPORT const wchar_t * HID_API_CALL  hid_error(hid_device *dev)
+HID_API_EXPORT const wchar_t * HID_API_CALL hid_error(hid_device *dev)
 {
-	wchar_t *error_str = get_error_str(dev);
+	struct device_error* device_error = find_device_error(dev);
+	wchar_t *error_str = device_error != NULL ? device_error->last_error_str : NULL;
 	if (error_str == NULL)
 		return L"Success";
 	return error_str;
+}
+
+HID_API_EXPORT int HID_API_CALL hid_error_code(hid_device *dev)
+{
+	struct device_error* device_error = find_device_error(dev);
+	int error_code = device_error != NULL ? device_error->last_error_code : 0;
+	return error_code;
 }
 
 #ifndef hidapi_winapi_EXPORTS
