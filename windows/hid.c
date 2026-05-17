@@ -2187,7 +2187,7 @@ int HID_API_EXPORT_CALL hid_winapi_get_instance_string(hid_device* dev, wchar_t*
 	}
 
 	/* Get the device id from interface path */
-	device_id = hid_internal_get_device_interface_property(interface_path, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
+	device_id = (wchar_t *)hid_internal_get_device_interface_property(interface_path, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
 	if (!device_id) {
 		register_string_error(dev, L"Failed to get device interface property InstanceId");
 		goto end;
@@ -2228,7 +2228,7 @@ int HID_API_EXPORT_CALL hid_winapi_get_parent_instance_string(hid_device* dev, w
 	}
 
 	/* Get the device id from interface path */
-	device_id = hid_internal_get_device_interface_property(interface_path, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
+	device_id = (wchar_t *)hid_internal_get_device_interface_property(interface_path, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
 	if (!device_id) {
 		register_string_error(dev, L"Failed to get device interface property InstanceId");
 		goto end;
@@ -2245,7 +2245,7 @@ int HID_API_EXPORT_CALL hid_winapi_get_parent_instance_string(hid_device* dev, w
 		goto end;
 
 	/* Get the compatible ids from parent devnode */
-	parent_id = hid_internal_get_devnode_property(dev_node, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
+	parent_id = (wchar_t *)hid_internal_get_devnode_property(dev_node, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
 	if (!parent_id) {
 		register_string_error(dev, L"Failed to get parent device interface property InstanceId");
 		goto end;
