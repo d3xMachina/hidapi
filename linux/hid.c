@@ -80,6 +80,7 @@ struct hid_device_ {
 	int device_handle;
 	int blocking;
 	wchar_t *last_error_str;
+	wchar_t *last_read_error_str;
 	struct hid_device_info* device_info;
 };
 
@@ -102,6 +103,7 @@ static hid_device *new_hid_device(void)
 	dev->device_handle = -1;
 	dev->blocking = 1;
 	dev->last_error_str = NULL;
+	dev->last_read_error_str = NULL;
 	dev->device_info = NULL;
 
 	return dev;
@@ -285,7 +287,7 @@ static __u32 get_hid_report_bytes(const __u8 *rpt, size_t len, size_t num_bytes,
  * Skips all nested Collection, i.e. iterates until the end of current level Collection.
  *
  * The return value is non-0 when an end of current Collection is found,
- * 0 when error is occured (broken Descriptor, end of a Collection is found before its begin,
+ * 0 when error is occurred (broken Descriptor, end of a Collection is found before its begin,
  *  or no Collection is found at all).
  */
 static int hid_iterate_over_collection(const __u8 *report_descriptor, __u32 size, unsigned int *pos, int *data_len, int *key_size)
@@ -405,8 +407,8 @@ static int get_next_hid_usage(const __u8 *report_descriptor, __u32 size, struct 
 	/* If no top-level application collection is found and usage page/usage pair is found, pair is valid
 	   https://docs.microsoft.com/en-us/windows-hardware/drivers/hid/top-level-collections */
 	if (initial && usage_found && ctx->usage_page_found) {
-			*usage_page = ctx->usage_page;
-			return 0; /* success */
+		*usage_page = ctx->usage_page;
+		return 0; /* success */
 	}
 
 	return 1; /* finished processing */
@@ -451,6 +453,8 @@ static int get_hid_report_descriptor_from_sysfs(const char *sysfs_path, struct h
 	/* Construct <sysfs_path>/device/report_descriptor */
 	size_t rpt_path_len = strlen(sysfs_path) + 25 + 1;
 	char* rpt_path = (char*) calloc(1, rpt_path_len);
+	if (!rpt_path)
+		return -1;
 	snprintf(rpt_path, rpt_path_len, "%s/device/report_descriptor", sysfs_path);
 
 	res = get_hid_report_descriptor(rpt_path, rpt_desc);
@@ -684,6 +688,7 @@ static struct hid_device_info * create_device_info_for_device(struct udev_device
 		case BUS_I2C:
 		case BUS_USB:
 		case BUS_SPI:
+		case BUS_VIRTUAL:
 			break;
 
 		default:
@@ -780,6 +785,14 @@ static struct hid_device_info * create_device_info_for_device(struct udev_device
 
 			break;
 
+		case BUS_VIRTUAL:
+			cur_dev->manufacturer_string = wcsdup(L"");
+			cur_dev->product_string = utf8_to_wchar_t(product_name_utf8);
+
+			cur_dev->bus_type = HID_API_BUS_VIRTUAL;
+
+			break;
+
 		default:
 			/* Unknown device type - this should never happen, as we
 			 * check for USB and Bluetooth devices above */
@@ -787,7 +800,14 @@ static struct hid_device_info * create_device_info_for_device(struct udev_device
 	}
 
 	/* Usage Page and Usage */
-	result = get_hid_report_descriptor_from_sysfs(sysfs_path, &report_desc);
+
+	if (sysfs_path) {
+		result = get_hid_report_descriptor_from_sysfs(sysfs_path, &report_desc);
+	}
+	else {
+		result = -1;
+	}
+
 	if (result >= 0) {
 		unsigned short page = 0, usage = 0;
 		struct hid_usage_iterator usage_iterator;
@@ -812,7 +832,7 @@ static struct hid_device_info * create_device_info_for_device(struct udev_device
 			struct hid_device_info *prev_dev = cur_dev;
 
 			if (!tmp)
-				continue;
+				break;
 			cur_dev->next = tmp;
 			cur_dev = tmp;
 
@@ -857,6 +877,7 @@ static struct hid_device_info * create_device_info_for_hid_device(hid_device *de
 	/* Create the udev object */
 	udev = udev_new();
 	if (!udev) {
+		errno = ENOMEM;
 		register_device_error(dev, "Couldn't create udev context");
 		return NULL;
 	}
@@ -869,6 +890,7 @@ static struct hid_device_info * create_device_info_for_hid_device(hid_device *de
 
 	if (!root) {
 		/* TODO: have a better error reporting via create_device_info_for_device */
+		errno = EIO;
 		register_device_error(dev, "Couldn't create hid_device_info");
 	}
 
@@ -902,8 +924,11 @@ static struct hid_hotplug_context {
 	pthread_t thread;
 
 	pthread_mutex_t mutex;
-	
-	int mutex_ready;
+
+	/* Boolean flags */
+	unsigned char mutex_ready;
+	unsigned char mutex_in_use;
+	unsigned char cb_list_dirty;
 
 	/* HIDAPI unique callback handle counter */
 	hid_hotplug_callback_handle next_handle;
@@ -934,27 +959,61 @@ struct hid_hotplug_callback {
 	struct hid_hotplug_callback *next;
 };
 
+static void hid_internal_hotplug_remove_postponed()
+{
+	/* Unregister the callbacks whose removal was postponed */
+	/* This function is always called inside a locked mutex */
+	/* However, any actions are only allowed if the mutex is NOT in use and if the DIRTY flag is set */
+	if (!hid_hotplug_context.mutex_ready || hid_hotplug_context.mutex_in_use || !hid_hotplug_context.cb_list_dirty) {
+		return;
+	}
+
+	/* Traverse the list of callbacks and check if any were marked for removal */
+	struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs;
+	while (*current) {
+		struct hid_hotplug_callback *callback = *current;
+		if (!callback->events) {
+			*current = (*current)->next;
+			free(callback);
+			continue;
+		}
+		current = &callback->next;
+	}
+	
+	/* Clear the flag so we don't start the cycle unless necessary */
+	hid_hotplug_context.cb_list_dirty = 0;
+}
+
 static void hid_internal_hotplug_cleanup()
 {
+	if (!hid_hotplug_context.mutex_ready || hid_hotplug_context.mutex_in_use) {
+		return;
+	}
+
+	/* Before checking if the list is empty, clear any entries whose removal was postponed first */
+	hid_internal_hotplug_remove_postponed();
+
 	if (hid_hotplug_context.hotplug_cbs != NULL) {
 		return;
 	}
 
 	pthread_join(hid_hotplug_context.thread, NULL);
-
-	/* Cleanup connected device list */
-	hid_free_enumeration(hid_hotplug_context.devs);
-	hid_hotplug_context.devs = NULL;
-	/* Disarm the udev monitor */
-	udev_monitor_unref(hid_hotplug_context.mon);
-	udev_unref(hid_hotplug_context.udev_ctx);
 }
 
 static void hid_internal_hotplug_init()
 {
 	if (!hid_hotplug_context.mutex_ready) {
-		pthread_mutex_init(&hid_hotplug_context.mutex, NULL);
+		/* Initialize the mutex as recursive */
+		pthread_mutexattr_t attr;
+		pthread_mutexattr_init(&attr);
+		pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+		pthread_mutex_init(&hid_hotplug_context.mutex, &attr);
+		pthread_mutexattr_destroy(&attr);
+
+		/* Set state to Ready */
 		hid_hotplug_context.mutex_ready = 1;
+		hid_hotplug_context.mutex_in_use = 0;
+		hid_hotplug_context.cb_list_dirty = 0;
 	}
 }
 
@@ -1112,23 +1171,28 @@ void  HID_API_EXPORT hid_free_enumeration(struct hid_device_info *devs)
 
 static void hid_internal_invoke_callbacks(struct hid_device_info *info, hid_hotplug_event event)
 {
+	pthread_mutex_lock(&hid_hotplug_context.mutex);
+	hid_hotplug_context.mutex_in_use = 1;
+
 	struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs;
 	while (*current) {
 		struct hid_hotplug_callback *callback = *current;
 		if ((callback->events & event) && hid_internal_match_device_id(info->vendor_id, info->product_id,
 																	   callback->vendor_id, callback->product_id)) {
 			int result = callback->callback(callback->handle, info, event, callback->user_data);
-			/* If the result is non-zero, we remove the callback and proceed */
-			/* Do not use the deregister call as it locks the mutex, and we are currently in a lock */
+			/* If the result is non-zero, we mark the callback for removal and proceed */
 			if (result) {
-				struct hid_hotplug_callback *callback = *current;
-				*current = (*current)->next;
-				free(callback);
+				(*current)->events = 0;
+				hid_hotplug_context.cb_list_dirty = 1;
 				continue;
 			}
 		}
 		current = &callback->next;
 	}
+
+	hid_hotplug_context.mutex_in_use = 0;
+	hid_internal_hotplug_remove_postponed();
+	pthread_mutex_unlock(&hid_hotplug_context.mutex);
 }
 
 static int match_udev_to_info(struct udev_device* raw_dev, struct hid_device_info *info)
@@ -1144,10 +1208,18 @@ static void* hotplug_thread(void* user_data)
 {
 	(void) user_data;
 
+	/* Note: the cleanup sequence is always executed with the mutex locked, so we shoud never lock the mutex without checking if we need to stop */
+
 	while (hid_hotplug_context.monitor_fd > 0) {
 		fd_set fds;
 		struct timeval tv;
 		int ret;
+
+		/* On every iteration, check if we still have any callbacks left and leave if none are left */
+		/* NOTE: the check is performed UNLOCKED and the value CAN change in the background */
+		if (!hid_hotplug_context.hotplug_cbs) {
+			break;
+		}
 
 		FD_ZERO(&fds);
 		FD_SET(hid_hotplug_context.monitor_fd, &fds);
@@ -1158,6 +1230,11 @@ static void* hotplug_thread(void* user_data)
 
 		ret = select(hid_hotplug_context.monitor_fd+1, &fds, NULL, NULL, &tv);
 
+		/* An extra check, just in case within those 5msec the thread was told to stop */
+		if (!hid_hotplug_context.hotplug_cbs) {
+			break;
+		}
+
 		/* Check if our file descriptor has received data. */
 		if (ret > 0 && FD_ISSET(hid_hotplug_context.monitor_fd, &fds)) {
 
@@ -1165,9 +1242,7 @@ static void* hotplug_thread(void* user_data)
 			   select() ensured that this will not block. */
 			struct udev_device *raw_dev = udev_monitor_receive_device(hid_hotplug_context.mon);
 			if (raw_dev) {
-				/* Lock the mutex so callback/device lists don't change elsewhere from here on */
 				pthread_mutex_lock(&hid_hotplug_context.mutex);
-
 				const char* action = udev_device_get_action(raw_dev);
 				if (!strcmp(action, "add")) {
 					// We create a list of all usages on this UDEV device
@@ -1201,7 +1276,7 @@ static void* hotplug_thread(void* user_data)
 							info->next = NULL;
 							hid_internal_invoke_callbacks(info, HID_API_HOTPLUG_EVENT_DEVICE_LEFT);
 							/* Free every removed device */
-							free(info);
+							hid_free_enumeration(info);
 						} else {
 							current = &info->next;
 						}
@@ -1212,6 +1287,14 @@ static void* hotplug_thread(void* user_data)
 			}
 		}
 	}
+
+	/* Cleanup connected device list */
+	hid_free_enumeration(hid_hotplug_context.devs);
+	hid_hotplug_context.devs = NULL;
+	/* Disarm the udev monitor */
+	udev_monitor_unref(hid_hotplug_context.mon);
+	udev_unref(hid_hotplug_context.udev_ctx);
+
 	return NULL;
 }
 
@@ -1271,7 +1354,7 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 	else {
 		// Prepare a UDEV context to run monitoring on
 		hid_hotplug_context.udev_ctx = udev_new();
-		if(!hid_hotplug_context.udev_ctx)
+		if (!hid_hotplug_context.udev_ctx)
 		{
 			pthread_mutex_unlock(&hid_hotplug_context.mutex);
 			return -1;
@@ -1292,6 +1375,26 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 		pthread_create(&hid_hotplug_context.thread, NULL, &hotplug_thread, NULL);
 	}
 
+	/* Mark the mutex as IN USE, to prevent callback removal from inside a callback */
+	unsigned char old_state = hid_hotplug_context.mutex_in_use;
+	hid_hotplug_context.mutex_in_use = 1;
+	
+	if ((flags & HID_API_HOTPLUG_ENUMERATE) && (events & HID_API_HOTPLUG_EVENT_DEVICE_ARRIVED)) {
+		struct hid_device_info* device = hid_hotplug_context.devs;
+		/* Notify about already connected devices, if asked so */
+		while (device != NULL) {
+			if (hid_internal_match_device_id(device->vendor_id, device->product_id, hotplug_cb->vendor_id, hotplug_cb->product_id)) {
+				(*hotplug_cb->callback)(hotplug_cb->handle, device, HID_API_HOTPLUG_EVENT_DEVICE_ARRIVED, hotplug_cb->user_data);
+			}
+
+			device = device->next;
+		}
+	}
+
+	hid_hotplug_context.mutex_in_use = old_state;
+
+	hid_internal_hotplug_cleanup();
+
 	pthread_mutex_unlock(&hid_hotplug_context.mutex);
 	
 	return 0;
@@ -1299,7 +1402,7 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 
 int HID_API_EXPORT HID_API_CALL hid_hotplug_deregister_callback(hid_hotplug_callback_handle callback_handle)
 {
-	if (!hid_hotplug_context.mutex_ready) {
+	if (!hid_hotplug_context.mutex_ready || callback_handle <= 0) {
 		return -1;
 	}
 
@@ -1315,9 +1418,15 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_deregister_callback(hid_hotplug_call
 	/* Remove this notification */
 	for (struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs; *current != NULL; current = &(*current)->next) {
 		if ((*current)->handle == callback_handle) {
-			struct hid_hotplug_callback *next = (*current)->next;
-			free(*current);
-			*current = next;
+			/* Check if we were already in a locked state, as we are NOT allowed to remove any callbacks if we are */
+			if (hid_hotplug_context.mutex_in_use) {
+				(*current)->events = 0;
+				hid_hotplug_context.cb_list_dirty = 1;
+			} else {
+				struct hid_hotplug_callback *next = (*current)->next;
+				free(*current);
+				*current = next;
+			}
 			result = 0;
 			break;
 		}
@@ -1382,6 +1491,7 @@ hid_device * HID_API_EXPORT hid_open_path(const char *path)
 
 	dev = new_hid_device();
 	if (!dev) {
+		errno = ENOMEM;
 		register_global_error("Couldn't allocate memory");
 		return NULL;
 	}
@@ -1394,8 +1504,8 @@ hid_device * HID_API_EXPORT hid_open_path(const char *path)
 		/* Make sure this is a HIDRAW device - responds to HIDIOCGRDESCSIZE */
 		res = ioctl(dev->device_handle, HIDIOCGRDESCSIZE, &desc_size);
 		if (res < 0) {
-			hid_close(dev);
 			register_global_error_format("ioctl(GRDESCSIZE) error for '%s', not a HIDRAW device?: %s", path, strerror(errno));
+			hid_close(dev);
 			return NULL;
 		}
 
@@ -1416,7 +1526,7 @@ int HID_API_EXPORT hid_write(hid_device *dev, const unsigned char *data, size_t 
 
 	if (!data || (length == 0)) {
 		errno = EINVAL;
-		register_device_error(dev, strerror(errno));
+		register_device_error(dev, "Zero buffer/length");
 		return -1;
 	}
 
@@ -1430,8 +1540,14 @@ int HID_API_EXPORT hid_write(hid_device *dev, const unsigned char *data, size_t 
 
 int HID_API_EXPORT hid_read_timeout(hid_device *dev, unsigned char *data, size_t length, int milliseconds)
 {
+	if (!data || (length == 0)) {
+		errno = EINVAL;
+		register_error_str(&dev->last_read_error_str, "Zero buffer/length");
+		return -1;
+	}
+
 	/* Set device error to none */
-	register_device_error(dev, NULL);
+	register_error_str(&dev->last_read_error_str, NULL);
 
 	int bytes_read;
 
@@ -1455,7 +1571,7 @@ int HID_API_EXPORT hid_read_timeout(hid_device *dev, unsigned char *data, size_t
 		}
 		if (ret == -1) {
 			/* Error */
-			register_device_error(dev, strerror(errno));
+			register_error_str(&dev->last_read_error_str, strerror(errno));
 			return ret;
 		}
 		else {
@@ -1463,7 +1579,8 @@ int HID_API_EXPORT hid_read_timeout(hid_device *dev, unsigned char *data, size_t
 			   indicate a device disconnection. */
 			if (fds.revents & (POLLERR | POLLHUP | POLLNVAL)) {
 				// We cannot use strerror() here as no -1 was returned from poll().
-				register_device_error(dev, "hid_read_timeout: unexpected poll error (device disconnected)");
+				errno = EIO;
+				register_error_str(&dev->last_read_error_str, "hid_read_timeout: unexpected poll error (device disconnected)");
 				return -1;
 			}
 		}
@@ -1474,7 +1591,7 @@ int HID_API_EXPORT hid_read_timeout(hid_device *dev, unsigned char *data, size_t
 		if (errno == EAGAIN || errno == EINPROGRESS)
 			bytes_read = 0;
 		else
-			register_device_error(dev, strerror(errno));
+			register_error_str(&dev->last_read_error_str, strerror(errno));
 	}
 
 	return bytes_read;
@@ -1483,6 +1600,13 @@ int HID_API_EXPORT hid_read_timeout(hid_device *dev, unsigned char *data, size_t
 int HID_API_EXPORT hid_read(hid_device *dev, unsigned char *data, size_t length)
 {
 	return hid_read_timeout(dev, data, length, (dev->blocking)? -1: 0);
+}
+
+HID_API_EXPORT const wchar_t * HID_API_CALL  hid_read_error(hid_device *dev)
+{
+	if (dev->last_read_error_str == NULL)
+		return L"Success";
+	return dev->last_read_error_str;
 }
 
 int HID_API_EXPORT hid_set_nonblocking(hid_device *dev, int nonblock)
@@ -1499,6 +1623,12 @@ int HID_API_EXPORT hid_send_feature_report(hid_device *dev, const unsigned char 
 {
 	int res;
 
+	if (!data || (length == 0)) {
+		errno = EINVAL;
+		register_device_error(dev, "Zero buffer/length");
+		return -1;
+	}
+
 	register_device_error(dev, NULL);
 
 	res = ioctl(dev->device_handle, HIDIOCSFEATURE(length), data);
@@ -1511,6 +1641,12 @@ int HID_API_EXPORT hid_send_feature_report(hid_device *dev, const unsigned char 
 int HID_API_EXPORT hid_get_feature_report(hid_device *dev, unsigned char *data, size_t length)
 {
 	int res;
+
+	if (!data || (length == 0)) {
+		errno = EINVAL;
+		register_device_error(dev, "Zero buffer/length");
+		return -1;
+	}
 
 	register_device_error(dev, NULL);
 
@@ -1525,6 +1661,12 @@ int HID_API_EXPORT HID_API_CALL hid_send_output_report(hid_device *dev, const un
 {
 	int res;
 
+	if (!data || (length == 0)) {
+		errno = EINVAL;
+		register_device_error(dev, "Zero buffer/length");
+		return -1;
+	}
+
 	register_device_error(dev, NULL);
 
 	res = ioctl(dev->device_handle, HIDIOCSOUTPUT(length), data);
@@ -1537,6 +1679,12 @@ int HID_API_EXPORT HID_API_CALL hid_send_output_report(hid_device *dev, const un
 int HID_API_EXPORT HID_API_CALL hid_get_input_report(hid_device *dev, unsigned char *data, size_t length)
 {
 	int res;
+
+	if (!data || (length == 0)) {
+		errno = EINVAL;
+		register_device_error(dev, "Zero buffer/length");
+		return -1;
+	}
 
 	register_device_error(dev, NULL);
 
@@ -1554,8 +1702,8 @@ void HID_API_EXPORT hid_close(hid_device *dev)
 
 	close(dev->device_handle);
 
-	/* Free the device error message */
-	register_device_error(dev, NULL);
+	free(dev->last_error_str);
+	free(dev->last_read_error_str);
 
 	hid_free_enumeration(dev->device_info);
 
@@ -1566,6 +1714,7 @@ void HID_API_EXPORT hid_close(hid_device *dev)
 int HID_API_EXPORT_CALL hid_get_manufacturer_string(hid_device *dev, wchar_t *string, size_t maxlen)
 {
 	if (!string || !maxlen) {
+		errno = EINVAL;
 		register_device_error(dev, "Zero buffer/length");
 		return -1;
 	}
@@ -1590,6 +1739,7 @@ int HID_API_EXPORT_CALL hid_get_manufacturer_string(hid_device *dev, wchar_t *st
 int HID_API_EXPORT_CALL hid_get_product_string(hid_device *dev, wchar_t *string, size_t maxlen)
 {
 	if (!string || !maxlen) {
+		errno = EINVAL;
 		register_device_error(dev, "Zero buffer/length");
 		return -1;
 	}
@@ -1614,6 +1764,7 @@ int HID_API_EXPORT_CALL hid_get_product_string(hid_device *dev, wchar_t *string,
 int HID_API_EXPORT_CALL hid_get_serial_number_string(hid_device *dev, wchar_t *string, size_t maxlen)
 {
 	if (!string || !maxlen) {
+		errno = EINVAL;
 		register_device_error(dev, "Zero buffer/length");
 		return -1;
 	}
@@ -1637,7 +1788,10 @@ int HID_API_EXPORT_CALL hid_get_serial_number_string(hid_device *dev, wchar_t *s
 
 
 HID_API_EXPORT struct hid_device_info *HID_API_CALL hid_get_device_info(hid_device *dev) {
-	if (!dev->device_info) {
+	if (dev->device_info) {
+		register_device_error(dev, NULL);
+	}
+	else {
 		// Lazy initialize device_info
 		dev->device_info = create_device_info_for_hid_device(dev);
 	}
@@ -1652,6 +1806,7 @@ int HID_API_EXPORT_CALL hid_get_indexed_string(hid_device *dev, int string_index
 	(void)string;
 	(void)maxlen;
 
+	errno = ENOSYS;
 	register_device_error(dev, "hid_get_indexed_string: not supported by hidraw");
 
 	return -1;
@@ -1661,6 +1816,15 @@ int HID_API_EXPORT_CALL hid_get_indexed_string(hid_device *dev, int string_index
 int HID_API_EXPORT_CALL hid_get_report_descriptor(hid_device *dev, unsigned char *buf, size_t buf_size)
 {
 	struct hidraw_report_descriptor rpt_desc;
+
+	if (!buf || !buf_size) {
+		errno = EINVAL;
+		register_device_error(dev, "Zero buffer/length");
+		return -1;
+	}
+
+	register_device_error(dev, NULL);
+
 	int res = get_hid_report_descriptor_from_hidraw(dev, &rpt_desc);
 	if (res < 0) {
 		/* error already registered */

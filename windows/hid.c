@@ -20,14 +20,14 @@
         https://github.com/libusb/hidapi .
 ********************************************************/
 
-#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
-/* Do not warn about wcsncpy usage.
-   https://docs.microsoft.com/cpp/c-runtime-library/security-features-in-the-crt */
-#define _CRT_SECURE_NO_WARNINGS
-#endif
-
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#ifdef WIN32_LEAN_AND_MEAN
+/* It may be set by IDE/project and apparently HIDAPI relies
+ * on certain Windows headers being included by default. */
+#undef WIN32_LEAN_AND_MEAN
 #endif
 
 #include "hidapi_winapi.h"
@@ -60,6 +60,16 @@ typedef LONG NTSTATUS;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* MSVC secure CRT (VS2005+) provides swprintf_s/wcsncpy_s.
+   Older MSVC and GCC/MinGW/Cygwin use the classic variants. */
+#if defined(_MSC_VER) && (_MSC_VER >= 1400)
+#define HIDAPI_SWPRINTF swprintf_s
+#define HIDAPI_WCSNCPY(dest, dest_count, src) wcsncpy_s((dest), (dest_count), (src), _TRUNCATE)
+#else
+#define HIDAPI_SWPRINTF swprintf
+#define HIDAPI_WCSNCPY(dest, dest_count, src) wcsncpy((dest), (src), (dest_count))
+#endif
 
 #ifdef MIN
 #undef MIN
@@ -163,11 +173,13 @@ static int lookup_functions()
 		goto err;
 	}
 
-#if defined(__GNUC__)
-# pragma GCC diagnostic push
-# pragma GCC diagnostic ignored "-Wcast-function-type"
-#endif
-#define RESOLVE(lib_handle, x) x = (x##_)GetProcAddress(lib_handle, #x); if (!x) goto err;
+/* Avoid direct function-pointer cast from FARPROC to typed callback pointer.
+   Using memcpy keeps this warning-free regardless of the compiler and compiler settings. */
+#define RESOLVE(lib_handle, x) do { \
+	FARPROC proc_addr = GetProcAddress(lib_handle, #x); \
+	if (!proc_addr) goto err; \
+	memcpy(&x, &proc_addr, sizeof(x)); \
+} while (0)
 
 	RESOLVE(hid_lib_handle, HidD_GetHidGuid);
 	RESOLVE(hid_lib_handle, HidD_GetAttributes);
@@ -194,9 +206,6 @@ static int lookup_functions()
 	RESOLVE(cfgmgr32_lib_handle, CM_Unregister_Notification);
 
 #undef RESOLVE
-#if defined(__GNUC__)
-# pragma GCC diagnostic pop
-#endif
 
 	return 0;
 
@@ -262,7 +271,10 @@ static struct hid_hotplug_context {
 	/* Critical section (faster mutex substitute), for both cached device list and callback list changes */
 	CRITICAL_SECTION critical_section;
 
-	BOOL critical_section_ready;
+	/* Boolean flags */
+	unsigned char mutex_ready;
+	unsigned char mutex_in_use;
+	unsigned char cb_list_dirty;
 
 	/* HIDAPI unique callback handle counter */
 	hid_hotplug_callback_handle next_handle;
@@ -274,7 +286,7 @@ static struct hid_hotplug_context {
 	struct hid_device_info *devs;
 } hid_hotplug_context = {
 	.notify_handle = NULL,
-	.critical_section_ready = 0,
+	.mutex_ready = 0,
 	.next_handle = FIRST_HOTPLUG_CALLBACK_HANDLE,
 	.hotplug_cbs = NULL,
 	.devs = NULL
@@ -501,7 +513,8 @@ static void register_winapi_error_to_device(struct device_error* error, const WC
 	if (!msg)
 		return;
 
-	int printf_written = swprintf(msg, msg_len + 1, L"%.*ls: (0x%08X) %.*ls", (int)op_len, op, error_code, (int)system_err_len, system_err_buf);
+	int printf_written = HIDAPI_SWPRINTF(msg, msg_len + 1, L"%.*ls: (0x%08X) %.*ls", (int)op_len, op, error_code, (int)system_err_len, system_err_buf);
+	msg[msg_len] = L'\0';
 
 	if (printf_written < 0)
 	{
@@ -512,7 +525,7 @@ static void register_winapi_error_to_device(struct device_error* error, const WC
 
 	/* Get rid of the CR and LF that FormatMessage() sticks at the
 	   end of the message. Thanks Microsoft! */
-	while(msg[msg_len-1] == L'\r' || msg[msg_len-1] == L'\n' || msg[msg_len-1] == L' ')
+	while (msg[msg_len-1] == L'\r' || msg[msg_len-1] == L'\n' || msg[msg_len-1] == L' ')
 	{
 		msg[msg_len-1] = L'\0';
 		msg_len--;
@@ -646,9 +659,13 @@ HID_API_EXPORT const char* HID_API_CALL hid_version_str(void)
 
 static void hid_internal_hotplug_init()
 {
-	if (!hid_hotplug_context.critical_section_ready) {
+	if (!hid_hotplug_context.mutex_ready) {
 		InitializeCriticalSection(&hid_hotplug_context.critical_section);
-		hid_hotplug_context.critical_section_ready = 1;
+
+		/* Set state to Ready */
+		hid_hotplug_context.mutex_ready = 1;
+		hid_hotplug_context.mutex_in_use = 0;
+		hid_hotplug_context.cb_list_dirty = 0;
 	}
 }
 
@@ -692,8 +709,52 @@ int HID_API_EXPORT hid_init(void)
 	return 0;
 }
 
+struct hid_hotplug_callback {
+    hid_hotplug_callback_handle handle;
+    unsigned short vendor_id;
+    unsigned short product_id;
+    hid_hotplug_event events;
+    void *user_data;
+    hid_hotplug_callback_fn callback;
+
+    /* Pointer to the next notification */
+    struct hid_hotplug_callback *next;
+};
+
+static void hid_internal_hotplug_remove_postponed()
+{
+	/* Unregister the callbacks whose removal was postponed */
+	/* This function is always called inside a locked mutex */
+	/* However, any actions are only allowed if the mutex is NOT in use and if the DIRTY flag is set */
+	if (!hid_hotplug_context.mutex_ready || hid_hotplug_context.mutex_in_use || !hid_hotplug_context.cb_list_dirty) {
+		return;
+	}
+	
+	/* Traverse the list of callbacks and check if any were marked for removal */
+	struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs;
+	while (*current) {
+		struct hid_hotplug_callback *callback = *current;
+		if (!callback->events) {
+			*current = (*current)->next;
+			free(callback);
+			continue;
+		}
+		current = &callback->next;
+	}
+	
+	/* Clear the flag so we don't start the cycle unless necessary */
+	hid_hotplug_context.cb_list_dirty = 0;
+}
+
 static void hid_internal_hotplug_cleanup()
 {
+	if (!hid_hotplug_context.mutex_ready || hid_hotplug_context.mutex_in_use) {
+		return;
+	}
+
+	/* Before checking if the list is empty, clear any entries whose removal was postponed first */
+	hid_internal_hotplug_remove_postponed();
+
 	/* Unregister the HID device connection notification when removing the last callback */
 	/* This function is always called inside a locked mutex */
 	if (hid_hotplug_context.hotplug_cbs != NULL) {
@@ -716,21 +777,9 @@ static void hid_internal_hotplug_cleanup()
 	hid_hotplug_context.notify_handle = NULL;
 }
 
-struct hid_hotplug_callback {
-	hid_hotplug_callback_handle handle;
-	unsigned short vendor_id;
-	unsigned short product_id;
-	hid_hotplug_event events;
-	void *user_data;
-	hid_hotplug_callback_fn callback;
-
-	/* Pointer to the next notification */
-	struct hid_hotplug_callback *next;
-};
-
 static void hid_internal_hotplug_exit()
 {
-	if (!hid_hotplug_context.critical_section_ready) {
+	if (!hid_hotplug_context.mutex_ready) {
 		/* If the critical section is not initialized, we are safe to assume nothing else is */
 		return;
 	}
@@ -744,17 +793,18 @@ static void hid_internal_hotplug_exit()
 	}
 	hid_internal_hotplug_cleanup();
 	LeaveCriticalSection(&hid_hotplug_context.critical_section);
-	hid_hotplug_context.critical_section_ready = 0;
+	hid_hotplug_context.mutex_ready = 0;
 	DeleteCriticalSection(&hid_hotplug_context.critical_section);
 }
 
 int HID_API_EXPORT hid_exit(void)
 {
+    hid_internal_hotplug_exit();
+
 #ifndef HIDAPI_USE_DDK
 	free_library_handles();
 	hidapi_initialized = FALSE;
 #endif
-	hid_internal_hotplug_exit();
 	tls_free_all_threads(NULL, TRUE);
 	return 0;
 }
@@ -827,7 +877,7 @@ static void hid_internal_get_usb_info(struct hid_device_info* dev, DEVINST dev_n
 {
 	wchar_t *device_id = NULL, *hardware_ids = NULL;
 
-	device_id = hid_internal_get_devnode_property(dev_node, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
+	device_id = (wchar_t *)hid_internal_get_devnode_property(dev_node, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
 	if (!device_id)
 		goto end;
 
@@ -845,7 +895,7 @@ static void hid_internal_get_usb_info(struct hid_device_info* dev, DEVINST dev_n
 	}
 
 	/* Get the hardware ids from devnode */
-	hardware_ids = hid_internal_get_devnode_property(dev_node, &DEVPKEY_Device_HardwareIds, DEVPROP_TYPE_STRING_LIST);
+	hardware_ids = (wchar_t *)hid_internal_get_devnode_property(dev_node, &DEVPKEY_Device_HardwareIds, DEVPROP_TYPE_STRING_LIST);
 	if (!hardware_ids)
 		goto end;
 
@@ -876,7 +926,7 @@ static void hid_internal_get_usb_info(struct hid_device_info* dev, DEVINST dev_n
 
 	/* Try to get USB device manufacturer string if not provided by HidD_GetManufacturerString. */
 	if (wcslen(dev->manufacturer_string) == 0) {
-		wchar_t* manufacturer_string = hid_internal_get_devnode_property(dev_node, &DEVPKEY_Device_Manufacturer, DEVPROP_TYPE_STRING);
+		wchar_t* manufacturer_string = (wchar_t *)hid_internal_get_devnode_property(dev_node, &DEVPKEY_Device_Manufacturer, DEVPROP_TYPE_STRING);
 		if (manufacturer_string) {
 			free(dev->manufacturer_string);
 			dev->manufacturer_string = manufacturer_string;
@@ -896,7 +946,7 @@ static void hid_internal_get_usb_info(struct hid_device_info* dev, DEVINST dev_n
 
 		/* Get the device id of the USB device. */
 		free(device_id);
-		device_id = hid_internal_get_devnode_property(usb_dev_node, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
+		device_id = (wchar_t *)hid_internal_get_devnode_property(usb_dev_node, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
 		if (!device_id)
 			goto end;
 
@@ -935,7 +985,7 @@ static void hid_internal_get_ble_info(struct hid_device_info* dev, DEVINST dev_n
 {
 	if (wcslen(dev->manufacturer_string) == 0) {
 		/* Manufacturer Name String (UUID: 0x2A29) */
-		wchar_t* manufacturer_string = hid_internal_get_devnode_property(dev_node, (const DEVPROPKEY*)&PKEY_DeviceInterface_Bluetooth_Manufacturer, DEVPROP_TYPE_STRING);
+		wchar_t* manufacturer_string = (wchar_t *)hid_internal_get_devnode_property(dev_node, (const DEVPROPKEY*)&PKEY_DeviceInterface_Bluetooth_Manufacturer, DEVPROP_TYPE_STRING);
 		if (manufacturer_string) {
 			free(dev->manufacturer_string);
 			dev->manufacturer_string = manufacturer_string;
@@ -944,7 +994,7 @@ static void hid_internal_get_ble_info(struct hid_device_info* dev, DEVINST dev_n
 
 	if (wcslen(dev->serial_number) == 0) {
 		/* Serial Number String (UUID: 0x2A25) */
-		wchar_t* serial_number = hid_internal_get_devnode_property(dev_node, (const DEVPROPKEY*)&PKEY_DeviceInterface_Bluetooth_DeviceAddress, DEVPROP_TYPE_STRING);
+		wchar_t* serial_number = (wchar_t *)hid_internal_get_devnode_property(dev_node, (const DEVPROPKEY*)&PKEY_DeviceInterface_Bluetooth_DeviceAddress, DEVPROP_TYPE_STRING);
 		if (serial_number) {
 			free(dev->serial_number);
 			dev->serial_number = serial_number;
@@ -953,13 +1003,13 @@ static void hid_internal_get_ble_info(struct hid_device_info* dev, DEVINST dev_n
 
 	if (wcslen(dev->product_string) == 0) {
 		/* Model Number String (UUID: 0x2A24) */
-		wchar_t* product_string = hid_internal_get_devnode_property(dev_node, (const DEVPROPKEY*)&PKEY_DeviceInterface_Bluetooth_ModelNumber, DEVPROP_TYPE_STRING);
+		wchar_t* product_string = (wchar_t *)hid_internal_get_devnode_property(dev_node, (const DEVPROPKEY*)&PKEY_DeviceInterface_Bluetooth_ModelNumber, DEVPROP_TYPE_STRING);
 		if (!product_string) {
 			DEVINST parent_dev_node = 0;
 			/* Fallback: Get devnode grandparent to reach out Bluetooth LE device node */
 			if (CM_Get_Parent(&parent_dev_node, dev_node, 0) == CR_SUCCESS) {
 				/* Device Name (UUID: 0x2A00) */
-				product_string = hid_internal_get_devnode_property(parent_dev_node, &DEVPKEY_NAME, DEVPROP_TYPE_STRING);
+				product_string = (wchar_t *)hid_internal_get_devnode_property(parent_dev_node, &DEVPKEY_NAME, DEVPROP_TYPE_STRING);
 			}
 		}
 
@@ -992,7 +1042,7 @@ static hid_internal_detect_bus_type_result hid_internal_detect_bus_type(const wc
 	hid_internal_detect_bus_type_result result = { 0 };
 
 	/* Get the device id from interface path */
-	device_id = hid_internal_get_device_interface_property(interface_path, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
+	device_id = (wchar_t *)hid_internal_get_device_interface_property(interface_path, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
 	if (!device_id)
 		goto end;
 
@@ -1007,7 +1057,7 @@ static hid_internal_detect_bus_type_result hid_internal_detect_bus_type(const wc
 		goto end;
 
 	/* Get the compatible ids from parent devnode */
-	compatible_ids = hid_internal_get_devnode_property(dev_node, &DEVPKEY_Device_CompatibleIds, DEVPROP_TYPE_STRING_LIST);
+	compatible_ids = (wchar_t *)hid_internal_get_devnode_property(dev_node, &DEVPKEY_Device_CompatibleIds, DEVPROP_TYPE_STRING_LIST);
 	if (!compatible_ids)
 		goto end;
 
@@ -1171,6 +1221,7 @@ static struct hid_device_info *hid_internal_get_device_info(const wchar_t *path,
 	case HID_API_BUS_UNKNOWN:
 	case HID_API_BUS_SPI:
 	case HID_API_BUS_I2C:
+	case HID_API_BUS_VIRTUAL:
 		/* shut down -Wswitch */
 		break;
 	}
@@ -1352,6 +1403,7 @@ DWORD WINAPI hid_internal_notify_callback(HCMNOTIFICATION notify, PVOID context,
 				if (_stricmp((*current)->path, path) == 0) {
 					struct hid_device_info *next = (*current)->next;
 					device = *current;
+					device->next = NULL;
 					*current = next;
 					break;
 				}
@@ -1362,28 +1414,34 @@ DWORD WINAPI hid_internal_notify_callback(HCMNOTIFICATION notify, PVOID context,
 	}
 
 	if (device) {
+		/* Mark the critical section as IN USE, to prevent callback removal from inside a callback */
+		hid_hotplug_context.mutex_in_use = 1;
+		
 		/* Call the notifications for the device */
 		struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs;
 		while (*current) {
 			struct hid_hotplug_callback *callback = *current;
 			if ((callback->events & hotplug_event) && hid_internal_match_device_id(device->vendor_id, device->product_id, callback->vendor_id, callback->product_id)) {
 				int result = (callback->callback)(callback->handle, device, hotplug_event, callback->user_data);
-				/* If the result is non-zero, we remove the callback and proceed */
-				/* Do not use the deregister call as it locks the mutex, and we are currently in a lock */
+				
+				/* If the result is non-zero, we MARK the callback for future removal and proceed */
+				/* We avoid changing the list until we are done calling the callbacks to simplify the process */
 				if (result) {
-					*current = (*current)->next;
-					free(callback);
-					continue;
+					callback->events = 0;
+					hid_hotplug_context.cb_list_dirty = 1;
 				}
 			}
 			current = &callback->next;
 		}
 
+		hid_hotplug_context.mutex_in_use = 0;
+
 		/* Free removed device */
 		if (hotplug_event == HID_API_HOTPLUG_EVENT_DEVICE_LEFT) {
-			free(device);
+			hid_free_enumeration(device);
 		}
 
+		/* Remove any callbacks that were marked for removal and stop the notification if none are left */
 		hid_internal_hotplug_cleanup();
 	}
 
@@ -1476,6 +1534,10 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 		}
 	}
 
+	/* Mark the critical section as IN USE, to prevent callback removal from inside a callback */
+	unsigned char old_state = hid_hotplug_context.mutex_in_use;
+	hid_hotplug_context.mutex_in_use = 1;
+	
 	if ((flags & HID_API_HOTPLUG_ENUMERATE) && (events & HID_API_HOTPLUG_EVENT_DEVICE_ARRIVED)) {
 		struct hid_device_info* device = hid_hotplug_context.devs;
 		/* Notify about already connected devices, if asked so */
@@ -1488,6 +1550,11 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 		}
 	}
 
+	hid_hotplug_context.mutex_in_use = old_state;
+
+	/* Remove any callbacks that were marked for removal and stop the notification if none are left */
+	hid_internal_hotplug_cleanup();
+	
 	LeaveCriticalSection(&hid_hotplug_context.critical_section);
 
 	return 0;
@@ -1495,7 +1562,7 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 
 int HID_API_EXPORT HID_API_CALL hid_hotplug_deregister_callback(hid_hotplug_callback_handle callback_handle)
 {
-	if (callback_handle <= 0 || !hid_hotplug_context.critical_section_ready) {
+	if (callback_handle <= 0 || !hid_hotplug_context.mutex_ready) {
 		return -1;
 	}
 
@@ -1510,9 +1577,16 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_deregister_callback(hid_hotplug_call
 	/* Remove this notification */
 	for (struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs; *current != NULL; current = &(*current)->next) {
 		if ((*current)->handle == callback_handle) {
-			struct hid_hotplug_callback *next = (*current)->next;
-			free(*current);
-			*current = next;
+			/* Check if we were already in the critical section, as we are NOT allowed to remove any callbacks if we are */
+			if (hid_hotplug_context.mutex_in_use) {
+				/* If we are not allowed to remove the callback, we mark it as pending removal */
+				(*current)->events = 0;
+				hid_hotplug_context.cb_list_dirty = 1;
+			} else {
+				struct hid_hotplug_callback *next = (*current)->next;
+				free(*current);
+				*current = next;
+			}
 			break;
 		}
 	}
@@ -2011,7 +2085,7 @@ int HID_API_EXPORT_CALL HID_API_CALL hid_get_manufacturer_string(hid_device *dev
 		return -1;
 	}
 
-	wcsncpy(string, dev->device_info->manufacturer_string, maxlen);
+	HIDAPI_WCSNCPY(string, maxlen, dev->device_info->manufacturer_string);
 	string[maxlen - 1] = L'\0';
 
 	register_string_error(dev, NULL);
@@ -2031,7 +2105,7 @@ int HID_API_EXPORT_CALL HID_API_CALL hid_get_product_string(hid_device *dev, wch
 		return -1;
 	}
 
-	wcsncpy(string, dev->device_info->product_string, maxlen);
+	HIDAPI_WCSNCPY(string, maxlen, dev->device_info->product_string);
 	string[maxlen - 1] = L'\0';
 
 	register_string_error(dev, NULL);
@@ -2051,7 +2125,7 @@ int HID_API_EXPORT_CALL HID_API_CALL hid_get_serial_number_string(hid_device *de
 		return -1;
 	}
 
-	wcsncpy(string, dev->device_info->serial_number, maxlen);
+	HIDAPI_WCSNCPY(string, maxlen, dev->device_info->serial_number);
 	string[maxlen - 1] = L'\0';
 
 	register_string_error(dev, NULL);
@@ -2059,12 +2133,15 @@ int HID_API_EXPORT_CALL HID_API_CALL hid_get_serial_number_string(hid_device *de
 	return 0;
 }
 
-HID_API_EXPORT struct hid_device_info * HID_API_CALL hid_get_device_info(hid_device *dev) {
+HID_API_EXPORT struct hid_device_info * HID_API_CALL hid_get_device_info(hid_device *dev)
+{
 	if (!dev->device_info)
 	{
 		register_string_error(dev, L"NULL device info");
 		return NULL;
 	}
+
+	register_string_error(dev, NULL);
 
 	return dev->device_info;
 }
@@ -2116,7 +2193,7 @@ int HID_API_EXPORT_CALL hid_winapi_get_instance_string(hid_device* dev, wchar_t*
 		goto end;
 	}
 
-	wcsncpy(string, device_id, maxlen);
+	HIDAPI_WCSNCPY(string, maxlen, device_id);
 	string[maxlen - 1] = L'\0';
 
 	register_string_error(dev, NULL);
@@ -2174,7 +2251,7 @@ int HID_API_EXPORT_CALL hid_winapi_get_parent_instance_string(hid_device* dev, w
 		goto end;
 	}
 
-	wcsncpy(string, parent_id, maxlen);
+	HIDAPI_WCSNCPY(string, maxlen, parent_id);
 	string[maxlen - 1] = L'\0';
 
 	register_string_error(dev, NULL);
@@ -2209,7 +2286,7 @@ int HID_API_EXPORT_CALL hid_winapi_get_container_id(hid_device *dev, GUID *conta
 	}
 
 	/* Get the device id from interface path */
-	device_id = hid_internal_get_device_interface_property(interface_path, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
+	device_id = (wchar_t *)hid_internal_get_device_interface_property(interface_path, &DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING);
 	if (!device_id) {
 		register_string_error(dev, L"Failed to get device interface property InstanceId");
 		goto end;
@@ -2248,9 +2325,17 @@ int HID_API_EXPORT_CALL hid_get_report_descriptor(hid_device *dev, unsigned char
 		return -1;
 	}
 
+
 	int res = hid_winapi_descriptor_reconstruct_pp_data(pp_data, buf, buf_size);
 
 	HidD_FreePreparsedData(pp_data);
+
+	if (res == 0) {
+		register_string_error(dev, NULL);
+	}
+	else {
+		register_string_error(dev, L"Failed to reconstruct descriptor from PREPARSED_DATA");
+	}
 
 	return res;
 }

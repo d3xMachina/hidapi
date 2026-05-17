@@ -146,6 +146,7 @@ struct hid_device_ {
 	pthread_barrier_t shutdown_barrier; /* Ensures correct shutdown sequence */
 	int shutdown_thread;
 	wchar_t *last_error_str;
+	wchar_t *last_read_error_str;
 };
 
 static hid_device *new_hid_device(void)
@@ -167,6 +168,7 @@ static hid_device *new_hid_device(void)
 	dev->device_info = NULL;
 	dev->shutdown_thread = 0;
 	dev->last_error_str = NULL;
+	dev->last_read_error_str = NULL;
 
 	/* Thread objects */
 	pthread_mutex_init(&dev->mutex, NULL);
@@ -199,6 +201,8 @@ static void free_hid_device(hid_device *dev)
 	if (dev->source)
 		CFRelease(dev->source);
 	free(dev->input_report_buf);
+	free(dev->last_error_str);
+	free(dev->last_read_error_str);
 	hid_free_enumeration(dev->device_info);
 
 	/* Clean up the thread objects */
@@ -497,7 +501,10 @@ static struct hid_hotplug_context {
 
 	pthread_mutex_t mutex;
 
-	int mutex_ready;
+	/* Boolean flags */
+	unsigned char mutex_ready;
+	unsigned char mutex_in_use;
+	unsigned char cb_list_dirty;
 
 	/* Linked list of the hotplug callbacks */
 	struct hid_hotplug_callback *hotplug_cbs;
@@ -516,8 +523,40 @@ static struct hid_hotplug_context {
 	.devs = NULL
 };
 
-static void hid_internal_hotplug_cleanup()
+static void hid_internal_hotplug_remove_postponed(void)
 {
+	/* Unregister the callbacks whose removal was postponed */
+	/* This function is always called inside a locked mutex */
+	/* However, any actions are only allowed if the mutex is NOT in use and if the DIRTY flag is set */
+	if (!hid_hotplug_context.mutex_ready || hid_hotplug_context.mutex_in_use || !hid_hotplug_context.cb_list_dirty) {
+		return;
+	}
+
+	/* Traverse the list of callbacks and check if any were marked for removal */
+	struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs;
+	while (*current) {
+		struct hid_hotplug_callback *callback = *current;
+		if (!callback->events) {
+			*current = (*current)->next;
+			free(callback);
+			continue;
+		}
+		current = &callback->next;
+	}
+
+	/* Clear the flag so we don't start the cycle unless necessary */
+	hid_hotplug_context.cb_list_dirty = 0;
+}
+
+static void hid_internal_hotplug_cleanup(void)
+{
+	if (!hid_hotplug_context.mutex_ready || hid_hotplug_context.mutex_in_use) {
+		return;
+	}
+
+	/* Before checking if the list is empty, clear any entries whose removal was postponed first */
+	hid_internal_hotplug_remove_postponed();
+
 	if (hid_hotplug_context.hotplug_cbs != NULL) {
 		return;
 	}
@@ -537,15 +576,24 @@ static void hid_internal_hotplug_cleanup()
 	pthread_join(hid_hotplug_context.thread, NULL);
 }
 
-static void hid_internal_hotplug_init()
+static void hid_internal_hotplug_init(void)
 {
 	if (!hid_hotplug_context.mutex_ready) {
-		pthread_mutex_init(&hid_hotplug_context.mutex, NULL);
+		/* Initialize the mutex as recursive */
+		pthread_mutexattr_t attr;
+		pthread_mutexattr_init(&attr);
+		pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+		pthread_mutex_init(&hid_hotplug_context.mutex, &attr);
+		pthread_mutexattr_destroy(&attr);
+
+		/* Set state to Ready */
 		hid_hotplug_context.mutex_ready = 1;
+		hid_hotplug_context.mutex_in_use = 0;
+		hid_hotplug_context.cb_list_dirty = 0;
 	}
 }
 
-static void hid_internal_hotplug_exit()
+static void hid_internal_hotplug_exit(void)
 {
 	if (!hid_hotplug_context.mutex_ready) {
 		return;
@@ -604,11 +652,12 @@ static int hid_internal_match_device_id(unsigned short vendor_id, unsigned short
 	return (expected_vendor_id == 0x0 || vendor_id == expected_vendor_id) && (expected_product_id == 0x0 || product_id == expected_product_id);
 }
 
-static void process_pending_events(void) {
+static void process_pending_events(void)
+{
 	SInt32 res;
 	do {
 		res = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, FALSE);
-	} while(res != kCFRunLoopRunFinished && res != kCFRunLoopRunTimedOut);
+	} while (res != kCFRunLoopRunFinished && res != kCFRunLoopRunTimedOut);
 }
 
 static int read_usb_interface_from_hid_service_parent(io_service_t hid_service)
@@ -671,10 +720,10 @@ static struct hid_device_info *create_device_info_with_usage(IOHIDDeviceRef dev,
 
 	/* A small trick to store an io_service_t tag along with hid_device_info for matching info with unplugged device */
 	cur_dev_ex = (struct hid_device_info_ex *)calloc(1, sizeof(struct hid_device_info_ex));
-	cur_dev = &(cur_dev_ex->info);
-	if (cur_dev == NULL) {
+	if (cur_dev_ex == NULL) {
 		return NULL;
 	}
+	cur_dev = &(cur_dev_ex->info);
 
 	dev_vid = get_vendor_id(dev);
 	dev_pid = get_product_id(dev);
@@ -925,23 +974,29 @@ void  HID_API_EXPORT hid_free_enumeration(struct hid_device_info *devs)
 
 static void hid_internal_invoke_callbacks(struct hid_device_info *info, hid_hotplug_event event)
 {
+	pthread_mutex_lock(&hid_hotplug_context.mutex);
+	hid_hotplug_context.mutex_in_use = 1;
+
 	struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs;
 	while (*current) {
 		struct hid_hotplug_callback *callback = *current;
 		if ((callback->events & event) && hid_internal_match_device_id(info->vendor_id, info->product_id,
 																	   callback->vendor_id, callback->product_id)) {
 			int result = callback->callback(callback->handle, info, event, callback->user_data);
-			/* If the result is non-zero, we remove the callback and proceed */
+			/* If the result is non-zero, we mark the callback for removal and proceed */
 			/* Do not use the deregister call as it locks the mutex, and we are currently in a lock */
 			if (result) {
-				struct hid_hotplug_callback *callback = *current;
-				*current = (*current)->next;
-				free(callback);
+				(*current)->events = 0;
+				hid_hotplug_context.cb_list_dirty = 1;
 				continue;
 			}
 		}
 		current = &callback->next;
 	}
+	
+	hid_hotplug_context.mutex_in_use = 0;
+	hid_internal_hotplug_remove_postponed();
+	pthread_mutex_unlock(&hid_hotplug_context.mutex);
 }
 
 static void hid_internal_hotplug_connect_callback(void *context, IOReturn result, void *sender, IOHIDDeviceRef device)
@@ -951,19 +1006,19 @@ static void hid_internal_hotplug_connect_callback(void *context, IOReturn result
 	(void) sender;
 
 	struct hid_device_info* info = create_device_info(device);
-	if(!info) {
+	if (!info) {
 		return;
 	}
 	struct hid_device_info* info_cur = info;
 	
-	/* NOTE: we don't call any callbacks and we don't lock the mutex during initialization: the mutex is held by the main thread, but it's waiting by a barrier*/
+	/* NOTE: we don't call any callbacks and we don't lock the mutex during initialization: the mutex is held by the main thread, but it's waiting by a barrier */
 	if (hid_hotplug_context.thread_state > 0)
 	{
 		/* Lock the mutex to avoid race conditions */
 		pthread_mutex_lock(&hid_hotplug_context.mutex);
 		
 		/* Invoke all callbacks */
-		while(info_cur)
+		while (info_cur)
 		{
 			hid_internal_invoke_callbacks(info_cur, HID_API_HOTPLUG_EVENT_DEVICE_ARRIVED);
 			info_cur = info_cur->next;
@@ -990,7 +1045,7 @@ static void hid_internal_hotplug_connect_callback(void *context, IOReturn result
 	}
 }
 
-int match_ref_to_info(IOHIDDeviceRef device, struct hid_device_info *info)
+static int match_ref_to_info(IOHIDDeviceRef device, struct hid_device_info *info)
 {
 	if (!device || !info) {
 		return 0;
@@ -1022,7 +1077,7 @@ static void hid_internal_hotplug_disconnect_callback(void *context, IOReturn res
 			info->next = NULL;
 			hid_internal_invoke_callbacks(info, HID_API_HOTPLUG_EVENT_DEVICE_LEFT);
 			/* Free every removed device */
-			free(info);
+			hid_free_enumeration(info);
 		} else {
 			current = &info->next;
 		}
@@ -1036,10 +1091,10 @@ static void hid_internal_hotplug_disconnect_callback(void *context, IOReturn res
 	}
 }
 
-static void hotplug_stop_callback(void *context)
+static void hotplug_stop_callback(void* context)
 {
-	hid_device *dev = (hid_device*) context;
-	CFRunLoopStop(dev->run_loop); /*TODO: CFRunLoopGetCurrent()*/
+	(void) context;
+	CFRunLoopStop(hid_hotplug_context.run_loop);
 }
 
 static void* hotplug_thread(void* user_data)
@@ -1049,7 +1104,7 @@ static void* hotplug_thread(void* user_data)
 	hid_hotplug_context.thread_state = 0;
 	hid_hotplug_context.manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
 
-	if(!hid_hotplug_context.run_loop_mode) {
+	if (!hid_hotplug_context.run_loop_mode) {
 		const char *str = "HIDAPI_hotplug";
 		hid_hotplug_context.run_loop_mode = CFStringCreateWithCString(NULL, str, kCFStringEncodingASCII);
 	}
@@ -1060,7 +1115,7 @@ static void* hotplug_thread(void* user_data)
 	hid_hotplug_context.run_loop = CFRunLoopGetCurrent();
 	
 	/* Create the RunLoopSource which is used to signal the
-	   event loop to stop when hid_close() is called. */
+	   event loop to stop when hid_internal_hotplug_cleanup() is called. */
 	CFRunLoopSourceContext ctx;
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.version = 0;
@@ -1178,6 +1233,10 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 		hid_hotplug_context.hotplug_cbs = hotplug_cb;
 	}
 
+	/* Mark the mutex as IN USE, to prevent callback removal from inside a callback */
+	unsigned char old_state = hid_hotplug_context.mutex_in_use;
+	hid_hotplug_context.mutex_in_use = 1;
+
 	if ((flags & HID_API_HOTPLUG_ENUMERATE) && (events & HID_API_HOTPLUG_EVENT_DEVICE_ARRIVED)) {
 		struct hid_device_info* device = hid_hotplug_context.devs;
 		/* Notify about already connected devices, if asked so */
@@ -1189,7 +1248,11 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_register_callback(unsigned short ven
 			device = device->next;
 		}
 	}
-	
+
+	hid_hotplug_context.mutex_in_use = old_state;
+
+	hid_internal_hotplug_cleanup();
+
 	pthread_mutex_unlock(&hid_hotplug_context.mutex);
 
 	return 0;
@@ -1213,9 +1276,15 @@ int HID_API_EXPORT HID_API_CALL hid_hotplug_deregister_callback(hid_hotplug_call
 	/* Remove this notification */
 	for (struct hid_hotplug_callback **current = &hid_hotplug_context.hotplug_cbs; *current != NULL; current = &(*current)->next) {
 		if ((*current)->handle == callback_handle) {
-			struct hid_hotplug_callback *next = (*current)->next;
-			free(*current);
-			*current = next;
+			/* Check if we were already in a locked state, as we are NOT allowed to remove any callbacks if we are */
+			if (hid_hotplug_context.mutex_in_use) {
+				(*current)->events = 0;
+				hid_hotplug_context.cb_list_dirty = 1;
+			} else {
+				struct hid_hotplug_callback *next = (*current)->next;
+				free(*current);
+				*current = next;
+			}
 			result = 0;
 			break;
 		}
@@ -1525,12 +1594,12 @@ static int set_report(hid_device *dev, IOHIDReportType type, const unsigned char
 	IOReturn res;
 	unsigned char report_id;
 
-	register_device_error(dev, NULL);
-
 	if (!data || (length == 0)) {
-		register_device_error(dev, strerror(EINVAL));
+		register_device_error(dev, "Zero buffer/length");
 		return -1;
 	}
+
+	register_device_error(dev, NULL);
 
 	report_id = data[0];
 
@@ -1565,9 +1634,16 @@ static int get_report(hid_device *dev, IOHIDReportType type, unsigned char *data
 	unsigned char *report = data;
 	CFIndex report_length = length;
 	IOReturn res = kIOReturnSuccess;
-	const unsigned char report_id = data[0];
+	unsigned char report_id;
+
+	if (!data || (length == 0)) {
+		register_device_error(dev, "Zero buffer/length");
+		return -1;
+	}
 
 	register_device_error(dev, NULL);
+
+	report_id = data[0];
 
 	if (report_id == 0x0) {
 		/* Not using numbered Reports.
@@ -1660,12 +1736,18 @@ static int cond_timedwait(hid_device *dev, pthread_cond_t *cond, pthread_mutex_t
 	}
 
 	return 0;
-
 }
 
 int HID_API_EXPORT hid_read_timeout(hid_device *dev, unsigned char *data, size_t length, int milliseconds)
 {
 	int bytes_read = -1;
+
+	if (!data || (length == 0)) {
+		register_error_str(&dev->last_read_error_str, "Zero buffer/length");
+		return -1;
+	}
+
+	register_error_str(&dev->last_read_error_str, NULL);
 
 	/* Lock the access to the report list. */
 	pthread_mutex_lock(&dev->mutex);
@@ -1680,7 +1762,7 @@ int HID_API_EXPORT hid_read_timeout(hid_device *dev, unsigned char *data, size_t
 	/* Return if the device has been disconnected. */
 	if (dev->disconnected) {
 		bytes_read = -1;
-		register_device_error(dev, "hid_read_timeout: device disconnected");
+		register_error_str(&dev->last_read_error_str, "hid_read_timeout: device disconnected");
 		goto ret;
 	}
 
@@ -1689,7 +1771,7 @@ int HID_API_EXPORT hid_read_timeout(hid_device *dev, unsigned char *data, size_t
 		   has been an error. An error code of -1 should
 		   be returned. */
 		bytes_read = -1;
-		register_device_error(dev, "hid_read_timeout: thread shutdown");
+		register_error_str(&dev->last_read_error_str, "hid_read_timeout: thread shutdown");
 		goto ret;
 	}
 
@@ -1703,7 +1785,7 @@ int HID_API_EXPORT hid_read_timeout(hid_device *dev, unsigned char *data, size_t
 			bytes_read = return_data(dev, data, length);
 		else {
 			/* There was an error, or a device disconnection. */
-			register_device_error(dev, "hid_read_timeout: error waiting for more data");
+			register_error_str(&dev->last_read_error_str, "hid_read_timeout: error waiting for more data");
 			bytes_read = -1;
 		}
 	}
@@ -1727,7 +1809,7 @@ int HID_API_EXPORT hid_read_timeout(hid_device *dev, unsigned char *data, size_t
 		} else if (res == ETIMEDOUT) {
 			bytes_read = 0;
 		} else {
-			register_device_error(dev, "hid_read_timeout:  error waiting for more data");
+			register_error_str(&dev->last_read_error_str, "hid_read_timeout: error waiting for more data");
 			bytes_read = -1;
 		}
 	}
@@ -1745,6 +1827,13 @@ ret:
 int HID_API_EXPORT hid_read(hid_device *dev, unsigned char *data, size_t length)
 {
 	return hid_read_timeout(dev, data, length, (dev->blocking)? -1: 0);
+}
+
+HID_API_EXPORT const wchar_t * HID_API_CALL hid_read_error(hid_device *dev)
+{
+	if (dev->last_read_error_str == NULL)
+		return L"Success";
+	return dev->last_read_error_str;
 }
 
 int HID_API_EXPORT hid_set_nonblocking(hid_device *dev, int nonblock)
@@ -1889,7 +1978,10 @@ int HID_API_EXPORT_CALL hid_get_serial_number_string(hid_device *dev, wchar_t *s
 }
 
 HID_API_EXPORT struct hid_device_info *HID_API_CALL hid_get_device_info(hid_device *dev) {
-	if (!dev->device_info) {
+	if (dev->device_info) {
+		register_device_error(dev, NULL);
+	}
+	else {
 		dev->device_info = create_device_info(dev->device_handle);
 		if (!dev->device_info) {
 			register_device_error(dev, "Failed to create hid_device_info");
@@ -1912,6 +2004,13 @@ int HID_API_EXPORT_CALL hid_get_indexed_string(hid_device *dev, int string_index
 
 int HID_API_EXPORT_CALL hid_darwin_get_location_id(hid_device *dev, uint32_t *location_id)
 {
+	if (!location_id) {
+		register_device_error(dev, "Location ID is NULL");
+		return -1;
+	}
+
+	register_device_error(dev, NULL);
+
 	int res = get_int_property(dev->device_handle, CFSTR(kIOHIDLocationIDKey));
 	if (res != 0) {
 		*location_id = (uint32_t) res;
@@ -1934,23 +2033,27 @@ int HID_API_EXPORT_CALL hid_darwin_get_open_exclusive(void)
 
 int HID_API_EXPORT_CALL hid_darwin_is_device_open_exclusive(hid_device *dev)
 {
-	if (!dev)
-		return -1;
-
 	return (dev->open_options == kIOHIDOptionsTypeSeizeDevice) ? 1 : 0;
 }
 
 int HID_API_EXPORT_CALL hid_get_report_descriptor(hid_device *dev, unsigned char *buf, size_t buf_size)
 {
+	if (!buf || !buf_size) {
+		register_device_error(dev, "Zero buffer/length");
+		return -1;
+	}
+
+	register_device_error(dev, NULL);
+
 	CFTypeRef ref = IOHIDDeviceGetProperty(dev->device_handle, CFSTR(kIOHIDReportDescriptorKey));
 	if (ref != NULL && CFGetTypeID(ref) == CFDataGetTypeID()) {
 		CFDataRef report_descriptor = (CFDataRef) ref;
 		const UInt8 *descriptor_buf = CFDataGetBytePtr(report_descriptor);
-		CFIndex descriptor_buf_len = CFDataGetLength(report_descriptor);
+		const CFIndex descriptor_buf_len = CFDataGetLength(report_descriptor);
 		size_t copy_len = (size_t) descriptor_buf_len;
 
 		if (descriptor_buf == NULL || descriptor_buf_len < 0) {
-			register_device_error(dev, "Zero buffer/length");
+			register_device_error(dev, "Zero descriptor from device");
 			return -1;
 		}
 
