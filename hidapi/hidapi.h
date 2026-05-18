@@ -486,28 +486,6 @@ extern "C" {
 		*/
 		int  HID_API_EXPORT HID_API_CALL hid_read(hid_device *dev, unsigned char *data, size_t length);
 
-		/** @brief Get a string describing the last error which occurred during hid_read/hid_read_timeout.
-
-			Since version 0.15.0, @ref HID_API_VERSION >= HID_API_MAKE_VERSION(0, 15, 0)
-
-			This function is intended for logging/debugging purposes.
-
-			This function guarantees to never return NULL for a valid @ref dev.
-			If there was no error in the last call to hid_read/hid_read_error -
-			the returned string clearly indicates that.
-
-			Strings returned from hid_read_error() must not be freed by the user,
-			i.e. owned by HIDAPI library.
-			Device-specific error string may remain allocated at most until hid_close() is called.
-
-			@ingroup API
-			@param dev A device handle. Shall never be NULL.
-
-			@returns
-				A string describing the hid_read/hid_read_timeout error (if any).
-		*/
-		HID_API_EXPORT const wchar_t* HID_API_CALL hid_read_error(hid_device *dev);
-
 		/** @brief Set the device handle to be non-blocking.
 
 			In non-blocking mode calls to hid_read() will return
